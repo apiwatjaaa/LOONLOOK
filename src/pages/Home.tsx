@@ -10,6 +10,9 @@ import { gsap, useGSAP } from '../lib/gsap'
 import { LOOKS } from '../data/looks'
 import { patterns } from '../data/patterns'
 
+// ลายที่ใช้บนผ้าตัวอย่างในการ์ด "เทียบ 3 สี"
+const heroStripe = (patterns.find((p) => p.id === 'gingham') ?? patterns[0]).src
+
 
 const steps = [
   {
@@ -219,10 +222,41 @@ function Home() {
         </div>
         <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-black/40" />
 
-        <div className="hero-card absolute right-4 top-24 z-10 flex max-w-[200px] flex-col gap-1 bg-bg p-4 sm:right-8">
-          <span className="text-[11px] uppercase tracking-[0.12em] text-muted">ใหม่</span>
-          <span className="text-sm text-ink">เทียบ 3 สีในครั้งเดียว</span>
-        </div>
+        {/* การ์ดฟีเจอร์ใหม่: ผ้า 3 ผืน 3 สีซ้อนกัน บนกระจกฝ้า กดไปสตูดิโอ */}
+        <Link
+          to="/studio"
+          className="hero-card group absolute right-4 top-20 z-10 flex w-[210px] flex-col gap-3 rounded-2xl border border-white/15 bg-white/10 p-3 text-white shadow-[0_24px_50px_-20px_rgba(0,0,0,0.7)] backdrop-blur-xl transition-colors hover:bg-white/15 sm:right-8 sm:top-24 sm:w-[240px]"
+        >
+          <span className="relative block h-20 [perspective:600px] sm:h-24">
+            {['#6d1f2a', '#cdb89a', '#1f2e4a'].map((hex, i) => (
+              <span
+                key={hex}
+                className="absolute top-1 h-[88%] w-[46%] overflow-hidden rounded-md shadow-[0_10px_20px_-8px_rgba(0,0,0,0.6)] transition-transform duration-500 ease-out"
+                style={{
+                  left: `${i * 27}%`,
+                  zIndex: i === 1 ? 3 : 1,
+                  transform: `rotate(${(i - 1) * 7}deg) translateY(${i === 1 ? -4 : 2}px)`,
+                  background: hex,
+                }}
+              >
+                <span
+                  className="absolute inset-0 opacity-60 mix-blend-soft-light"
+                  style={{ backgroundImage: `url("${heroStripe}")`, backgroundSize: '28px 28px' }}
+                />
+                <span className="absolute inset-0 bg-gradient-to-br from-white/25 via-transparent to-black/40" />
+              </span>
+            ))}
+          </span>
+          <span className="flex items-end justify-between gap-2 px-1">
+            <span className="flex flex-col gap-0.5">
+              <span className="text-[10px] uppercase tracking-[0.16em] text-white/60">ใหม่ · New</span>
+              <span className="text-sm leading-snug">เทียบ 3 สีในครั้งเดียว</span>
+            </span>
+            <span className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-white text-ink transition-transform group-hover:translate-x-0.5">
+              →
+            </span>
+          </span>
+        </Link>
 
         <div className="absolute inset-x-0 bottom-0 flex flex-col gap-6 px-6 pb-10 sm:px-10 sm:pb-14">
           <p
