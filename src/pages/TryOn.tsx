@@ -39,6 +39,33 @@ function uprightFit(fit: Fit): Fit {
   return { ...fit, angle }
 }
 
+// ปรับขนาดเฉพาะตอนลองสวมจริง (สตูดิโอใช้ค่าเดิม)
+// จุดไหล่/สะโพกที่ MediaPipe ให้มาคือ "ข้อต่อ" ซึ่งแคบกว่าตัวจริง ชุดเลยดูเล็ก
+// → ขยายความกว้าง + ยืดขึ้นให้คลุมไหล่ และให้เสื้อทับขอบกางเกงเล็กน้อย
+const AR_TUNE = {
+  top: { w: 1.28, h: 1.14, up: 0.07 }, // เสื้อ + ของที่ยึดไหล่→สะโพก (เข็มขัด/ผ้าพันคอ)
+  bottom: { w: 1.45, h: 1.06, up: 0.05 }, // กระโปรง/กางเกง
+  diagonal: { w: 1.15, h: 1.05, up: 0 }, // สายคาดเฉียง
+}
+
+function tuneForBody(fit: Fit, garment: Garment): Fit {
+  const t =
+    garment.anchors.from.length < 2
+      ? AR_TUNE.diagonal
+      : garment.anchors.from[0] === 23
+        ? AR_TUNE.bottom
+        : AR_TUNE.top
+  const shift = t.up * fit.height
+  // เลื่อน "ขึ้น" ตามแนวเอียงของตัว (หมุนตามมุมไหล่/สะโพก)
+  return {
+    x: fit.x + shift * Math.sin(fit.angle),
+    y: fit.y - shift * Math.cos(fit.angle),
+    width: fit.width * t.w,
+    height: fit.height * t.h,
+    angle: fit.angle,
+  }
+}
+
 // สีตัวแทนของชุด (ใช้ทำปุ่มในแถบเลือกชุด)
 function swatchOf(outfit: OutfitConfigs) {
   const config = outfit.top ?? outfit.full ?? outfit.bottom
@@ -213,7 +240,12 @@ function TryOn() {
                 canvas.height,
               )
               if (fit) {
-                renderGarment(ctx, item.image, item.smooth(uprightFit(fit)))
+                // เงานุ่ม ๆ ใต้ชุด ให้ดูซ้อนอยู่บนตัว ไม่แบนเหมือนกระดาษ
+                ctx.shadowColor = 'rgba(0,0,0,0.35)'
+                ctx.shadowBlur = fit.width * 0.06
+                ctx.shadowOffsetY = fit.width * 0.02
+                renderGarment(ctx, item.image, item.smooth(tuneForBody(uprightFit(fit), item.garment)))
+                ctx.shadowColor = 'transparent'
                 drawn++
               }
             }
@@ -242,18 +274,25 @@ function TryOn() {
 
     // รูปจากกล้อง + ชุด + ลายน้ำชื่อโครงงาน
     const snap = document.createElement('canvas')
-    snap.width = canvas.width
-    snap.height = canvas.height
+    // ตัดภาพให้ตรงกับที่เห็นบนจอ (จอแสดงแบบ object-cover)
+    const view = canvas.getBoundingClientRect()
+    const viewRatio = view.width / view.height
+    let sw = canvas.width
+    let sh = canvas.height
+    if (sw / sh > viewRatio) sw = Math.round(sh * viewRatio)
+    else sh = Math.round(sw / viewRatio)
+    snap.width = sw
+    snap.height = sh
     const ctx = snap.getContext('2d')
     if (!ctx) return
-    ctx.drawImage(canvas, 0, 0)
-    const size = Math.max(18, Math.round(canvas.width * 0.04))
+    ctx.drawImage(canvas, (canvas.width - sw) / 2, (canvas.height - sh) / 2, sw, sh, 0, 0, sw, sh)
+    const size = Math.max(18, Math.round(sw * 0.05))
     ctx.font = `italic ${size}px "Bodoni Moda", serif`
     ctx.fillStyle = 'rgba(255,255,255,0.85)'
     ctx.textAlign = 'right'
     ctx.textBaseline = 'bottom'
-    const margin = Math.round(canvas.width * 0.04)
-    ctx.fillText('Long Look', canvas.width - margin, canvas.height - margin)
+    const margin = Math.round(sw * 0.045)
+    ctx.fillText('Long Look', sw - margin, sh - margin)
 
     // ใช้ JPEG ให้ไฟล์เล็ก (ที่เก็บในเบราว์เซอร์มีจำกัด)
     const dataUrl = snap.toDataURL('image/jpeg', 0.88)
