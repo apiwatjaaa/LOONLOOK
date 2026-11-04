@@ -11,7 +11,7 @@ import { LOOKS } from '../data/looks'
 import { findPattern } from '../data/patterns'
 import { composeGarmentToImage } from '../design/composeGarment'
 import { addGalleryPhoto } from '../lib/gallery'
-import { drawLegs, drawSkirt, drawTorso, type Pt } from '../lib/warpGarment'
+import { drawAccessory, drawBottom, drawTop, measureMask, type Body, type MaskInfo, type Pt } from '../lib/warpGarment'
 import { readSavedOutfits, type SavedOutfit } from '../lib/savedOutfits'
 import type { CustomPatterns, OutfitConfigs } from '../store/useOutfit'
 import { useOutfitStore } from '../store/useOutfit'
@@ -23,7 +23,22 @@ type EquippedItem = {
   garment: Garment
   image: HTMLImageElement
   smooth: ReturnType<typeof createSmoother>
+  info: MaskInfo
 }
+
+// วิธีสวมแต่ละแบบ: band = ช่วงลำตัวในรูปเสื้อ (ไม่รวมแขน), sleeve = แขนเสื้อที่วาดตามแขนจริง
+const TOPS: Record<string, { band: [number, number]; sleeve: 'none' | 'short' | 'long'; hem?: number }> = {
+  'top-temp': { band: [0.19, 0.81], sleeve: 'short' },
+  'top-crop': { band: [0.2, 0.8], sleeve: 'short', hem: 0.62 },
+  'top-shirt': { band: [0.18, 0.82], sleeve: 'long', hem: 1.08 },
+  'top-tank': { band: [0.19, 0.81], sleeve: 'none' },
+  'top-jacket': { band: [0.17, 0.83], sleeve: 'long', hem: 1.1 },
+}
+const ACCESSORIES: Record<string, { width: number; raise: number }> = {
+  'acc-scarf': { width: 0.62, raise: 0.2 }, // รอบคอ ห้อยลงหน้าอก
+  'acc-belt': { width: 1.12, raise: 0.0 }, // คาดเอว กว้างเท่าตัว
+}
+const PANTS = new Set(['bottom-wide', 'bottom-shorts'])
 
 // ตัวเลือกชุดในแถบล่าง: ชุดจากสตูดิโอ / ลุคสำเร็จรูป / ชุดที่บันทึกไว้
 type LookOption = { id: string; label: string; outfit: OutfitConfigs; custom?: CustomPatterns }
@@ -141,7 +156,7 @@ function TryOn() {
             rotation: config.rotation ?? 0,
             finish: config.finish ?? 'matte',
           })
-          next.push({ garment, image, smooth: createSmoother(0.4) })
+          next.push({ garment, image, smooth: createSmoother(0.4), info: measureMask(image) })
         } catch (err) {
           console.error(err)
         }
@@ -242,10 +257,17 @@ function TryOn() {
             }
             const seen = (i: number) => (landmarks[i]?.visibility ?? 1) >= 0.5
             const pts: Record<number, Pt> = {}
-            for (const i of [11, 12, 23, 24, 25, 26, 27, 28]) pts[i] = P(i)
+            for (const i of [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]) pts[i] = P(i)
             // เข่ามองไม่เห็น → ประมาณกึ่งกลางสะโพก-ข้อเท้า
-            const kneeR = seen(26) ? pts[26] : { x: (pts[24].x + pts[28].x) / 2, y: (pts[24].y + pts[28].y) / 2 }
-            const kneeL = seen(25) ? pts[25] : { x: (pts[23].x + pts[27].x) / 2, y: (pts[23].y + pts[27].y) / 2 }
+            const half = (a: Pt, b: Pt) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 })
+            const body: Body = {
+              sR: pts[12], sL: pts[11], hR: pts[24], hL: pts[23],
+              kR: seen(26) ? pts[26] : half(pts[24], pts[28]),
+              kL: seen(25) ? pts[25] : half(pts[23], pts[27]),
+              aR: pts[28], aL: pts[27],
+              eR: seen(14) ? pts[14] : null, eL: seen(13) ? pts[13] : null,
+              wR: seen(16) ? pts[16] : null, wL: seen(15) ? pts[15] : null,
+            }
 
             // วาดชุดทุกชิ้นลงชั้นแยก แล้วค่อยแปะลงภาพพร้อมเงา (เงาจะได้ไม่แตกเป็นช่อง ๆ)
             const layer = layerRef.current ?? (layerRef.current = document.createElement('canvas'))
@@ -255,24 +277,20 @@ function TryOn() {
             if (lctx) lctx.clearRect(0, 0, layer.width, layer.height)
 
             let drawn = 0
-            let shoulderW = 0
+            const shoulderW = Math.hypot(pts[11].x - pts[12].x, pts[11].y - pts[12].y)
             for (const item of equippedRef.current) {
               const g = item.garment
               // ใช้ fitGarment เช็กว่ากล้องเห็นจุดยึดของชิ้นนี้ครบไหม
               const fit = fitGarment(landmarks, g.anchors, g.widthScale, g.offsetY, canvas.width, canvas.height)
               if (!fit || !lctx) continue
               drawn++
-              shoulderW = Math.max(shoulderW, Math.hypot(pts[11].x - pts[12].x, pts[11].y - pts[12].y))
-              if (g.anchors.from.length < 2) {
-                // สายคาดเฉียง: วางแบบเดิม (หมุนตามแนวเฉียง)
-                renderGarment(lctx, item.image, item.smooth(tuneForBody(uprightFit(fit), g)))
-              } else if (g.anchors.from[0] === 23) {
-                const isPants = g.id === 'bottom-wide' || g.id === 'bottom-shorts'
-                const draw = isPants ? drawLegs : drawSkirt
-                draw(lctx, item.image, pts[24], pts[23], kneeR, kneeL, pts[28], pts[27], g.widthScale * AR_TUNE.bottom.w, 0.07)
-              } else {
-                drawTorso(lctx, item.image, pts[12], pts[11], pts[24], pts[23], g.widthScale * AR_TUNE.top.w, 0.14)
-              }
+              const top = TOPS[g.id]
+              const acc = ACCESSORIES[g.id]
+              if (g.slot === 'bottom') drawBottom(lctx, item.image, body, item.info, PANTS.has(g.id))
+              else if (top) drawTop(lctx, item.image, body, top.band, top.sleeve, top.hem)
+              else if (acc) drawAccessory(lctx, item.image, body, item.info, acc.width, acc.raise)
+              // สายคาดเฉียง/อื่น ๆ: วางแบบเดิม (หมุนตามแนวเฉียง)
+              else renderGarment(lctx, item.image, item.smooth(tuneForBody(uprightFit(fit), g)))
             }
             if (drawn) {
               // เงานุ่ม ๆ ใต้ชุด ให้ดูซ้อนอยู่บนตัว ไม่แบนเหมือนกระดาษ
