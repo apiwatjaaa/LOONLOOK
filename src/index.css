@@ -1,0 +1,167 @@
+@import "tailwindcss";
+
+/* ฟอนต์ติดตั้งในโปรเจกต์ (ไม่โหลดจาก Google) ตาม DESIGN.md v2 ข้อ 2 */
+@import "@fontsource/bodoni-moda/400.css";
+@import "@fontsource/bodoni-moda/400-italic.css";
+@import "@fontsource/noto-sans-thai/200.css";
+@import "@fontsource/noto-sans-thai/300.css";
+@import "@fontsource/ibm-plex-sans-thai/300.css";
+@import "@fontsource/ibm-plex-sans-thai/400.css";
+
+@theme {
+  /* หัวข้อไทย (ไม่มีหัว) */
+  --font-heading: "Noto Sans Thai", sans-serif;
+  /* wordmark / คำอังกฤษตัวยักษ์ */
+  --font-wordmark: "Bodoni Moda", serif;
+  /* เนื้อหา / UI */
+  --font-sans: "IBM Plex Sans Thai", system-ui, sans-serif;
+
+  --color-bg: #ffffff;
+  --color-ivory: #f4f1ec;
+  --color-stone: #e8e4de;
+  --color-ink: #111111;
+  --color-muted: #6b6661;
+  --color-line: #ddd8d1;
+  --color-night: #0e0e0e;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-weight: 300;
+  background: var(--color-bg);
+  color: var(--color-ink);
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-heading);
+  font-weight: 300;
+  letter-spacing: 0;
+}
+
+/* เกรนฟิล์มบาง ๆ ทับทั้งหน้า กันไม่ให้ภาพดูแบนแบบดิจิทัล (DESIGN.md ข้อ 4.10) */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  pointer-events: none;
+  opacity: 0.035;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* ธีมองค์ประกอบของเบราว์เซอร์ให้เข้ากับโทนของแอป ไม่ใช่ค่าเริ่มต้นของเบราว์เซอร์ */
+::selection {
+  background: var(--color-ink);
+  color: var(--color-bg);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-ink);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+* {
+  scrollbar-color: var(--color-ink) var(--color-stone);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--color-stone);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-ink);
+  border-radius: 999px;
+  border: 2px solid var(--color-stone);
+}
+
+input[type="range"] {
+  accent-color: var(--color-ink);
+}
+
+/* ปุ่มตาม DESIGN.md ข้อ 10 — ทรงแคปซูล สูง 48px ไม่มีเงา ไม่มีไล่สี
+   อยู่ใน @layer components เพื่อให้ utility class ของ Tailwind (เช่น h-10, px-5)
+   ที่ใส่ต่อท้ายใน className ยังoverride ค่าพื้นฐานพวกนี้ได้ตามปกติ */
+@layer components {
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: 48px;
+    padding: 0 28px;
+    border-radius: 999px;
+    font-family: var(--font-sans);
+    font-size: 13px;
+    font-weight: 400;
+    letter-spacing: 0.08em;
+    white-space: nowrap;
+    transition: opacity 0.2s ease;
+  }
+
+  .btn-primary {
+    background: var(--color-ink);
+    color: var(--color-bg);
+    border: none;
+  }
+
+  .btn-primary:hover {
+    opacity: 0.85;
+  }
+
+  .btn-secondary {
+    background: transparent;
+    color: var(--color-ink);
+    border: 1px solid var(--color-ink);
+  }
+
+  .btn-secondary:hover {
+    opacity: 0.6;
+  }
+
+  .btn-text {
+    height: auto;
+    padding: 0;
+    border-radius: 0;
+    color: var(--color-ink);
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 4px;
+  }
+
+  .btn-text:hover {
+    opacity: 0.6;
+  }
+}
+
+/* แถบตัวหนังสือวิ่งไม่สิ้นสุด (DESIGN.md ข้อ 4.9) */
+@keyframes marquee {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+.marquee-track {
+  animation: marquee 24s linear infinite;
+}
+
+.marquee-track:hover {
+  animation-duration: 90s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .marquee-track {
+    animation: none;
+  }
+}

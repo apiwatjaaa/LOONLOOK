@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 40 40">
+  <rect width="40" height="40" fill="#3B3B24" />
+  <defs>
+    <g id="blobA" fill="#6B4423">
+      <path d="M0,-6 C5,-7 8,-3 7,2 C9,6 4,9 -1,7 C-6,8 -9,3 -7,-2 C-8,-6 -4,-8 0,-6 Z" />
+    </g>
+    <g id="blobB" fill="#17140F">
+      <path d="M0,-4 C4,-5 6,-1 5,3 C6,6 2,7 -2,5 C-5,6 -6,2 -4,-1 C-5,-4 -2,-5 0,-4 Z" />
+    </g>
+  </defs>
+  <use href="#blobA" x="10" y="10" />
+  <use href="#blobA" x="30" y="26" transform="rotate(50 30 26)" />
+  <use href="#blobB" x="27" y="8" transform="rotate(-20 27 8)" />
+  <use href="#blobB" x="8" y="30" transform="rotate(30 8 30)" />
+  <use href="#blobA" x="0" y="0" />
+  <use href="#blobA" x="40" y="0" />
+  <use href="#blobA" x="0" y="40" />
+  <use href="#blobA" x="40" y="40" />
+  <use href="#blobB" x="20" y="0" transform="rotate(90 20 0)" />
+  <use href="#blobB" x="20" y="40" transform="rotate(90 20 40)" />
+  <use href="#blobB" x="0" y="20" />
+  <use href="#blobB" x="40" y="20" />
+</svg>
