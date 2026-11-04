@@ -11,6 +11,7 @@ import { LOOKS } from '../data/looks'
 import { findPattern } from '../data/patterns'
 import { composeGarmentToImage } from '../design/composeGarment'
 import { addGalleryPhoto } from '../lib/gallery'
+import { drawLegs, drawSkirt, drawTorso, type Pt } from '../lib/warpGarment'
 import { readSavedOutfits, type SavedOutfit } from '../lib/savedOutfits'
 import type { CustomPatterns, OutfitConfigs } from '../store/useOutfit'
 import { useOutfitStore } from '../store/useOutfit'
@@ -82,6 +83,8 @@ function TryOn() {
   const cancelledRef = useRef(false)
   const facingRef = useRef<Facing>('user')
   const hintRef = useRef('')
+  const pointsRef = useRef<Record<number, Pt>>({})
+  const layerRef = useRef<HTMLCanvasElement | null>(null)
 
   const [phase, setPhase] = useState<Phase>('intro')
   const [errorMsg, setErrorMsg] = useState('')
@@ -229,25 +232,55 @@ function TryOn() {
           if (!landmarks) {
             updateHint('ยืนให้กล้องเห็นตัวคุณ')
           } else {
+            // ทำให้จุดข้อต่อนิ่งขึ้น (EMA) ก่อนเอาไปยืดชุด
+            const P = (i: number): Pt => {
+              const raw = { x: landmarks[i].x * canvas.width, y: landmarks[i].y * canvas.height }
+              const prev = pointsRef.current[i]
+              const next = prev ? { x: prev.x + 0.45 * (raw.x - prev.x), y: prev.y + 0.45 * (raw.y - prev.y) } : raw
+              pointsRef.current[i] = next
+              return next
+            }
+            const seen = (i: number) => (landmarks[i]?.visibility ?? 1) >= 0.5
+            const pts: Record<number, Pt> = {}
+            for (const i of [11, 12, 23, 24, 25, 26, 27, 28]) pts[i] = P(i)
+            // เข่ามองไม่เห็น → ประมาณกึ่งกลางสะโพก-ข้อเท้า
+            const kneeR = seen(26) ? pts[26] : { x: (pts[24].x + pts[28].x) / 2, y: (pts[24].y + pts[28].y) / 2 }
+            const kneeL = seen(25) ? pts[25] : { x: (pts[23].x + pts[27].x) / 2, y: (pts[23].y + pts[27].y) / 2 }
+
+            // วาดชุดทุกชิ้นลงชั้นแยก แล้วค่อยแปะลงภาพพร้อมเงา (เงาจะได้ไม่แตกเป็นช่อง ๆ)
+            const layer = layerRef.current ?? (layerRef.current = document.createElement('canvas'))
+            if (layer.width !== canvas.width) layer.width = canvas.width
+            if (layer.height !== canvas.height) layer.height = canvas.height
+            const lctx = layer.getContext('2d')
+            if (lctx) lctx.clearRect(0, 0, layer.width, layer.height)
+
             let drawn = 0
+            let shoulderW = 0
             for (const item of equippedRef.current) {
-              const fit = fitGarment(
-                landmarks,
-                item.garment.anchors,
-                item.garment.widthScale,
-                item.garment.offsetY,
-                canvas.width,
-                canvas.height,
-              )
-              if (fit) {
-                // เงานุ่ม ๆ ใต้ชุด ให้ดูซ้อนอยู่บนตัว ไม่แบนเหมือนกระดาษ
-                ctx.shadowColor = 'rgba(0,0,0,0.35)'
-                ctx.shadowBlur = fit.width * 0.06
-                ctx.shadowOffsetY = fit.width * 0.02
-                renderGarment(ctx, item.image, item.smooth(tuneForBody(uprightFit(fit), item.garment)))
-                ctx.shadowColor = 'transparent'
-                drawn++
+              const g = item.garment
+              // ใช้ fitGarment เช็กว่ากล้องเห็นจุดยึดของชิ้นนี้ครบไหม
+              const fit = fitGarment(landmarks, g.anchors, g.widthScale, g.offsetY, canvas.width, canvas.height)
+              if (!fit || !lctx) continue
+              drawn++
+              shoulderW = Math.max(shoulderW, Math.hypot(pts[11].x - pts[12].x, pts[11].y - pts[12].y))
+              if (g.anchors.from.length < 2) {
+                // สายคาดเฉียง: วางแบบเดิม (หมุนตามแนวเฉียง)
+                renderGarment(lctx, item.image, item.smooth(tuneForBody(uprightFit(fit), g)))
+              } else if (g.anchors.from[0] === 23) {
+                const isPants = g.id === 'bottom-wide' || g.id === 'bottom-shorts'
+                const draw = isPants ? drawLegs : drawSkirt
+                draw(lctx, item.image, pts[24], pts[23], kneeR, kneeL, pts[28], pts[27], g.widthScale * AR_TUNE.bottom.w, 0.07)
+              } else {
+                drawTorso(lctx, item.image, pts[12], pts[11], pts[24], pts[23], g.widthScale * AR_TUNE.top.w, 0.14)
               }
+            }
+            if (drawn) {
+              // เงานุ่ม ๆ ใต้ชุด ให้ดูซ้อนอยู่บนตัว ไม่แบนเหมือนกระดาษ
+              ctx.shadowColor = 'rgba(0,0,0,0.35)'
+              ctx.shadowBlur = shoulderW * 0.12
+              ctx.shadowOffsetY = shoulderW * 0.04
+              ctx.drawImage(layer, 0, 0)
+              ctx.shadowColor = 'transparent'
             }
             updateHint(drawn < equippedRef.current.length ? 'ถอยห่างอีกนิด ให้กล้องเห็นถึงเข่า' : '')
           }
