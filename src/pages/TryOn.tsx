@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 import BodyOutline from '../components/BodyOutline'
 import { fitGarment } from '../ar/fitGarment'
 import { detectPose, getPoseLandmarker } from '../ar/poseDetector'
 import { renderGarment } from '../ar/renderGarment'
-import { createSmoother } from '../ar/smoothing'
+import { createSmoother, type Fit } from '../ar/smoothing'
 import type { Garment, GarmentSlot } from '../data/garments'
 import { garments, SLOT_DRAW_ORDER } from '../data/garments'
-import { findPattern, patterns } from '../data/patterns'
+import { LOOKS } from '../data/looks'
+import { findPattern } from '../data/patterns'
 import { composeGarmentToImage } from '../design/composeGarment'
 import { addGalleryPhoto } from '../lib/gallery'
 import { readSavedOutfits, type SavedOutfit } from '../lib/savedOutfits'
@@ -14,6 +16,7 @@ import type { CustomPatterns, OutfitConfigs } from '../store/useOutfit'
 import { useOutfitStore } from '../store/useOutfit'
 
 type Phase = 'intro' | 'loading' | 'ready' | 'error'
+type Facing = 'user' | 'environment'
 
 type EquippedItem = {
   garment: Garment
@@ -21,36 +24,26 @@ type EquippedItem = {
   smooth: ReturnType<typeof createSmoother>
 }
 
-// ชุดตัวอย่างชั่วคราว ใช้เมื่อเข้าหน้านี้ตรงโดยไม่ได้ผ่านสตูดิโอมาก่อน
-const DEFAULT_IDS = ['bottom-temp', 'top-temp', 'sash-temp']
+// ตัวเลือกชุดในแถบล่าง: ชุดจากสตูดิโอ / ลุคสำเร็จรูป / ชุดที่บันทึกไว้
+type LookOption = { id: string; label: string; outfit: OutfitConfigs; custom?: CustomPatterns }
 
-function buildDefaultConfigs(): OutfitConfigs {
-  const configs: OutfitConfigs = {}
-  for (const id of DEFAULT_IDS) {
-    const garment = garments.find((g) => g.id === id)
-    if (!garment) continue
-    configs[garment.slot] = {
-      garmentId: garment.id,
-      patternId: patterns[0].id,
-      hue: 0,
-      saturation: 100,
-      scale: 1,
-    }
-  }
-  return configs
+// เข้าหน้านี้ตรง ๆ (ยังไม่ได้ออกแบบ) ใช้ลุค "คลาสสิก" เป็นชุดเริ่มต้น
+const DEFAULT_LOOK = LOOKS.find((l) => l.id === 'classic') ?? LOOKS[0]
+
+// มุมของเส้นไหล่/สะโพกจาก MediaPipe อาจกลับหัว (ซ้าย-ขวาสลับกัน → มุม ≈ 180°)
+// บีบมุมให้อยู่ในช่วง -90°..90° ให้เสื้อตั้งตรงเสมอ (สูตรเดียวกับ placeGarment ในสตูดิโอ)
+function uprightFit(fit: Fit): Fit {
+  let angle = fit.angle
+  if (angle > Math.PI / 2) angle -= Math.PI
+  if (angle < -Math.PI / 2) angle += Math.PI
+  return { ...fit, angle }
 }
 
-const DEFAULT_CONFIGS = buildDefaultConfigs()
-const SLOT_PRIORITY: GarmentSlot[] = ['full', 'top', 'bottom', 'accessory']
-
-function representativePattern(configs: OutfitConfigs) {
-  for (const slot of SLOT_PRIORITY) {
-    const config = configs[slot]
-    if (!config) continue
-    const pattern = patterns.find((p) => p.id === config.patternId) ?? patterns[0]
-    return { pattern, hue: config.hue, saturation: config.saturation }
-  }
-  return null
+// สีตัวแทนของชุด (ใช้ทำปุ่มในแถบเลือกชุด)
+function swatchOf(outfit: OutfitConfigs) {
+  const config = outfit.top ?? outfit.full ?? outfit.bottom
+  if (!config) return { src: '', tint: '#444' }
+  return { src: findPattern(config.patternId).src, tint: config.tint ?? null }
 }
 
 function TryOn() {
@@ -60,13 +53,20 @@ function TryOn() {
   const streamRef = useRef<MediaStream | null>(null)
   const rafRef = useRef(0)
   const cancelledRef = useRef(false)
+  const facingRef = useRef<Facing>('user')
+  const hintRef = useRef('')
 
   const [phase, setPhase] = useState<Phase>('intro')
   const [errorMsg, setErrorMsg] = useState('')
-  const [captureMessage, setCaptureMessage] = useState('')
+  const [hint, setHint] = useState('')
+  const [facing, setFacing] = useState<Facing>('user')
+  const [timer, setTimer] = useState<0 | 3 | 10>(0)
+  const [countdown, setCountdown] = useState(0)
   const [flash, setFlash] = useState(false)
+  const [shot, setShot] = useState<string | null>(null)
+  const [savedNote, setSavedNote] = useState('')
   const [savedLooks, setSavedLooks] = useState<SavedOutfit[]>([])
-  const [activeLookId, setActiveLookId] = useState<string | null>(null)
+  const [activeId, setActiveId] = useState('current')
 
   const storeConfigs = useOutfitStore((s) => s.configs)
   const storeCustomPatterns = useOutfitStore((s) => s.customPatterns)
@@ -75,27 +75,33 @@ function TryOn() {
     setSavedLooks(readSavedOutfits())
   }, [])
 
-  const activeLook = activeLookId ? savedLooks.find((look) => look.id === activeLookId) ?? null : null
   const hasStoreOutfit = Object.keys(storeConfigs).length > 0
-  const activeConfigs: OutfitConfigs = activeLook?.outfit ?? (hasStoreOutfit ? storeConfigs : DEFAULT_CONFIGS)
-  const activeCustomPatterns: CustomPatterns = activeLook ? {} : storeCustomPatterns
+  const options: LookOption[] = [
+    hasStoreOutfit
+      ? { id: 'current', label: 'ชุดของฉัน', outfit: storeConfigs, custom: storeCustomPatterns }
+      : { id: 'current', label: DEFAULT_LOOK.name, outfit: DEFAULT_LOOK.outfit },
+    ...LOOKS.filter((l) => hasStoreOutfit || l.id !== DEFAULT_LOOK.id).map((l) => ({
+      id: `look-${l.id}`,
+      label: l.name,
+      outfit: l.outfit as OutfitConfigs,
+    })),
+    ...savedLooks.map((s, i) => ({ id: `saved-${s.id}`, label: `บันทึก ${i + 1}`, outfit: s.outfit })),
+  ]
+  const active = options.find((o) => o.id === activeId) ?? options[0]
+  const activeKey = JSON.stringify([active.id, active.outfit])
 
-  // คอมโพสชุดที่กำลังใช้อยู่ให้เป็นรูปสำหรับวาดบน canvas AR ใหม่ทุกครั้งที่สลับลุค
+  // คอมโพสชุดที่เลือกให้เป็นรูป สำหรับวาดทับกล้อง (ทำใหม่ทุกครั้งที่สลับชุด)
   useEffect(() => {
     let cancelled = false
-
     async function build() {
       const next: EquippedItem[] = []
-      for (const slot of Object.keys(activeConfigs) as GarmentSlot[]) {
-        const config = activeConfigs[slot]
+      for (const slot of Object.keys(active.outfit) as GarmentSlot[]) {
+        const config = active.outfit[slot]
         if (!config || config.enabled === false) continue
         const garment = garments.find((g) => g.id === config.garmentId)
         if (!garment) continue
-        const customPattern = activeCustomPatterns[slot]
-        const pattern =
-          customPattern && customPattern.id === config.patternId
-            ? customPattern
-            : findPattern(config.patternId)
+        const custom = active.custom?.[slot]
+        const pattern = custom && custom.id === config.patternId ? custom : findPattern(config.patternId)
         try {
           const image = await composeGarmentToImage(garment.maskSrc, pattern.src, garment.shadingSrc, {
             hue: config.hue,
@@ -113,33 +119,50 @@ function TryOn() {
       next.sort((a, b) => SLOT_DRAW_ORDER[a.garment.slot] - SLOT_DRAW_ORDER[b.garment.slot])
       if (!cancelled) equippedRef.current = next
     }
-
     build()
     return () => {
       cancelled = true
     }
-  }, [activeLookId, storeConfigs, storeCustomPatterns, activeConfigs, activeCustomPatterns])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeKey])
+
+  function stopStream() {
+    cancelAnimationFrame(rafRef.current)
+    streamRef.current?.getTracks().forEach((track) => track.stop())
+    streamRef.current = null
+  }
 
   useEffect(
     () => () => {
       cancelledRef.current = true
-      cancelAnimationFrame(rafRef.current)
-      streamRef.current?.getTracks().forEach((track) => track.stop())
+      stopStream()
     },
     [],
   )
 
-  async function startCamera() {
+  function updateHint(next: string) {
+    if (hintRef.current === next) return
+    hintRef.current = next
+    setHint(next)
+  }
+
+  async function startCamera(nextFacing: Facing = facingRef.current) {
+    stopStream()
     setPhase('loading')
     cancelledRef.current = false
+    facingRef.current = nextFacing
+    setFacing(nextFacing)
 
     try {
       const [landmarker, mediaStream] = await Promise.all([
         getPoseLandmarker(),
-        navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false }),
+        navigator.mediaDevices.getUserMedia({
+          video: { facingMode: nextFacing, width: { ideal: 1280 }, height: { ideal: 1280 } },
+          audio: false,
+        }),
       ])
       if (cancelledRef.current) {
-        mediaStream.getTracks().forEach((track) => track.stop())
+        mediaStream.getTracks().forEach((track: MediaStreamTrack) => track.stop())
         return
       }
       streamRef.current = mediaStream
@@ -147,34 +170,39 @@ function TryOn() {
       const video = videoRef.current
       const canvas = canvasRef.current
       if (!video || !canvas) return
-
       video.srcObject = mediaStream
       await video.play()
       setPhase('ready')
 
       const ctx = canvas.getContext('2d')
       if (!ctx) return
+      let lastTs = 0
 
       const loop = () => {
-        if (cancelledRef.current || !video || !canvas) return
+        if (cancelledRef.current) return
         if (video.videoWidth && video.videoHeight) {
-          canvas.width = video.videoWidth
-          canvas.height = video.videoHeight
+          if (canvas.width !== video.videoWidth) canvas.width = video.videoWidth
+          if (canvas.height !== video.videoHeight) canvas.height = video.videoHeight
 
-          const result = detectPose(landmarker, video, performance.now())
+          // timestamp ต้องเพิ่มขึ้นเสมอ ไม่งั้น MediaPipe จะ error
+          const ts = Math.max(performance.now(), lastTs + 1)
+          lastTs = ts
+          const result = detectPose(landmarker, video, ts)
+          // กล้องหน้า = กลับด้านแบบกระจก / กล้องหลัง = ภาพตรง
+          const mirror = facingRef.current === 'user'
 
-          // กลับด้านภาพแบบกระจก (ผู้ใช้เห็นตัวเองเหมือนมองกระจก)
           ctx.save()
-          ctx.scale(-1, 1)
-          ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height)
-          ctx.restore()
-
-          const landmarks = result.landmarks[0]
-          if (landmarks) {
-            ctx.save()
+          if (mirror) {
             ctx.scale(-1, 1)
             ctx.translate(-canvas.width, 0)
+          }
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
 
+          const landmarks = result.landmarks[0]
+          if (!landmarks) {
+            updateHint('ยืนให้กล้องเห็นตัวคุณ')
+          } else {
+            let drawn = 0
             for (const item of equippedRef.current) {
               const fit = fitGarment(
                 landmarks,
@@ -185,16 +213,16 @@ function TryOn() {
                 canvas.height,
               )
               if (fit) {
-                renderGarment(ctx, item.image, item.smooth(fit))
+                renderGarment(ctx, item.image, item.smooth(uprightFit(fit)))
+                drawn++
               }
             }
-
-            ctx.restore()
+            updateHint(drawn < equippedRef.current.length ? 'ถอยห่างอีกนิด ให้กล้องเห็นถึงเข่า' : '')
           }
+          ctx.restore()
         }
         rafRef.current = requestAnimationFrame(loop)
       }
-
       rafRef.current = requestAnimationFrame(loop)
     } catch (err) {
       if (cancelledRef.current) return
@@ -202,151 +230,268 @@ function TryOn() {
       setPhase('error')
       setErrorMsg(
         err instanceof DOMException && err.name === 'NotAllowedError'
-          ? 'กรุณาอนุญาตให้เว็บไซต์เข้าถึงกล้อง'
-          : 'ไม่สามารถเปิดกล้องหรือโหลดโมเดลตรวจจับร่างกายได้',
+          ? 'เว็บยังไม่ได้รับอนุญาตให้ใช้กล้อง กดอนุญาตในหน้าต่างที่เด้งขึ้น หรือเปิดสิทธิ์กล้องในการตั้งค่าเบราว์เซอร์'
+          : 'เปิดกล้องไม่ได้ ลองเปิดเว็บนี้ใน Safari หรือ Chrome แทนแอปอื่น (เช่น Instagram / LINE)',
       )
     }
   }
 
-  function handleCapture() {
+  function takePhoto() {
     const canvas = canvasRef.current
     if (!canvas || phase !== 'ready') return
 
-    // รวม canvas ปัจจุบัน + ลายน้ำชื่อโครงงาน (ข้อ 6.8) แล้วเก็บ/ดาวน์โหลด
+    // รูปจากกล้อง + ชุด + ลายน้ำชื่อโครงงาน
     const snap = document.createElement('canvas')
     snap.width = canvas.width
     snap.height = canvas.height
     const ctx = snap.getContext('2d')
     if (!ctx) return
     ctx.drawImage(canvas, 0, 0)
-
-    ctx.font = `300 ${Math.max(16, Math.round(canvas.width * 0.028))}px "IBM Plex Sans Thai", sans-serif`
-    ctx.fillStyle = 'rgba(255,255,255,0.8)'
+    const size = Math.max(18, Math.round(canvas.width * 0.04))
+    ctx.font = `italic ${size}px "Bodoni Moda", serif`
+    ctx.fillStyle = 'rgba(255,255,255,0.85)'
     ctx.textAlign = 'right'
     ctx.textBaseline = 'bottom'
-    const margin = Math.round(canvas.width * 0.03)
+    const margin = Math.round(canvas.width * 0.04)
     ctx.fillText('Long Look', canvas.width - margin, canvas.height - margin)
 
-    const dataUrl = snap.toDataURL('image/png')
-    addGalleryPhoto(dataUrl)
+    // ใช้ JPEG ให้ไฟล์เล็ก (ที่เก็บในเบราว์เซอร์มีจำกัด)
+    const dataUrl = snap.toDataURL('image/jpeg', 0.88)
+    try {
+      addGalleryPhoto(dataUrl)
+      setSavedNote('เก็บไว้ในแกลเลอรีแล้ว')
+    } catch {
+      setSavedNote('แกลเลอรีเต็ม — กดบันทึกรูปลงเครื่องแทน')
+    }
+    setShot(dataUrl)
 
-    const link = document.createElement('a')
-    link.href = dataUrl
-    link.download = `longlook-${Date.now()}.png`
-    link.click()
-
-    // จอกระพริบขาวเบา ๆ ยืนยันว่าถ่ายแล้ว (DESIGN.md ข้อ 9)
     const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches
     setFlash(true)
-    window.setTimeout(() => setFlash(false), reduced ? 0 : 120)
-
-    setCaptureMessage('บันทึกรูปแล้ว ดูได้ในแกลเลอรี')
-    window.setTimeout(() => setCaptureMessage(''), 2500)
+    window.setTimeout(() => setFlash(false), reduced ? 0 : 140)
   }
+
+  function handleShutter() {
+    if (countdown > 0) return
+    if (timer === 0) return takePhoto()
+    // ตั้งเวลาถ่าย: วางมือถือแล้วถอยไปยืนเต็มตัวได้
+    let left: number = timer
+    setCountdown(left)
+    const id = window.setInterval(() => {
+      left -= 1
+      setCountdown(left)
+      if (left <= 0) {
+        window.clearInterval(id)
+        takePhoto()
+      }
+    }, 1000)
+  }
+
+  async function sharePhoto() {
+    if (!shot) return
+    const blob = await (await fetch(shot)).blob()
+    const file = new File([blob], `longlook-${Date.now()}.jpg`, { type: 'image/jpeg' })
+    // มือถือ: เปิดเมนูแชร์ (บันทึกลงอัลบั้ม / ส่ง LINE / IG) · คอม: ดาวน์โหลดไฟล์
+    if (navigator.canShare?.({ files: [file] })) {
+      try {
+        await navigator.share({ files: [file], title: 'Long Look' })
+        return
+      } catch {
+        /* ผู้ใช้กดยกเลิก */
+        return
+      }
+    }
+    const link = document.createElement('a')
+    link.href = shot
+    link.download = file.name
+    link.click()
+  }
+
+  const iconBtn =
+    'flex h-11 w-11 items-center justify-center rounded-full border border-white/20 bg-black/35 text-white backdrop-blur-md transition-colors hover:bg-black/55'
 
   return (
     <div className="relative flex flex-1 flex-col">
       {phase === 'intro' && (
         <div className="relative flex flex-1 flex-col items-center justify-center gap-7 overflow-hidden bg-night px-6 py-16 text-center">
-          <BodyOutline className="h-48 w-auto text-white/25" />
+          <span
+            aria-hidden
+            className="pointer-events-none absolute inset-x-0 top-[12%] select-none text-center font-wordmark text-[26vw] italic leading-none text-white/[0.04] sm:text-[180px]"
+          >
+            Try-On
+          </span>
+          <BodyOutline className="relative h-44 w-auto text-white/25" />
+          <h1 className="relative font-heading text-3xl text-white">ลองสวมผ่านกล้อง</h1>
 
-          <h1 className="font-heading text-3xl text-white">ลองสวม</h1>
+          <ol className="relative flex w-full max-w-xs flex-col gap-2.5 text-left text-sm text-white/75">
+            {[
+              'วางมือถือพิงไว้ หรือให้เพื่อนถือ',
+              'ถอยห่าง 1.5–2 เมตร ให้เห็นตั้งแต่หัวถึงเข่า',
+              'อยู่ในที่สว่าง แล้วกดถ่าย (ตั้งเวลาได้)',
+            ].map((t, i) => (
+              <li key={t} className="flex items-center gap-3 rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2.5">
+                <span className="font-wordmark text-lg italic text-white/50">0{i + 1}</span>
+                {t}
+              </li>
+            ))}
+          </ol>
 
-          <ul className="flex flex-col gap-3 text-sm text-white/70">
-            <li>ยืนห่างจากกล้องประมาณ 1.5–2 เมตร</li>
-            <li>อยู่ในที่ที่มีแสงสว่างเพียงพอ</li>
-            <li>ให้กล้องเห็นตั้งแต่หัวถึงเข่า</li>
-          </ul>
-
-          <button type="button" onClick={startCamera} className="btn btn-primary bg-white text-ink hover:opacity-85">
+          <button
+            type="button"
+            onClick={() => startCamera('user')}
+            className="btn btn-primary relative bg-white px-8 text-ink hover:opacity-85"
+          >
             เปิดกล้อง
           </button>
-
-          <p className="max-w-xs text-xs text-white/85">
+          <p className="relative max-w-xs text-xs text-white/60">
             ภาพจากกล้องประมวลผลในเครื่องคุณเท่านั้น ไม่ถูกส่งออกไปไหน
           </p>
         </div>
       )}
 
       {phase !== 'intro' && (
-        <div className="relative flex-1 bg-night">
+        // กล้องเต็มจอ (สูงเท่าจอลบแถบเมนูบน)
+        <div className="relative h-[calc(100svh-3.5rem)] w-full overflow-hidden bg-night">
           <video ref={videoRef} className="hidden" playsInline muted />
-          <canvas ref={canvasRef} className="h-full w-full object-cover" />
+          <canvas ref={canvasRef} className="absolute inset-0 h-full w-full object-cover" />
 
-          {flash && <div className="pointer-events-none absolute inset-0 bg-white/70" />}
+          {flash && <div className="pointer-events-none absolute inset-0 z-40 bg-white/80" />}
 
           {phase === 'loading' && (
-            <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-night/90 text-white">
-              <span
-                aria-hidden
-                className="h-9 w-9 animate-spin rounded-full border-[3px] border-white/25 border-t-white"
-              />
+            <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-3 bg-night text-white">
+              <span aria-hidden className="h-9 w-9 animate-spin rounded-full border-[3px] border-white/25 border-t-white" />
               <p className="text-sm">กำลังเปิดกล้องและโหลดโมเดล...</p>
             </div>
           )}
 
           {phase === 'error' && (
-            <div className="absolute inset-0 flex items-center justify-center bg-night/90 px-6 text-center text-white">
-              <p className="text-sm">{errorMsg}</p>
+            <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-5 bg-night px-8 text-center text-white">
+              <p className="max-w-xs text-sm leading-relaxed">{errorMsg}</p>
+              <button type="button" onClick={() => startCamera()} className="btn bg-white px-6 text-ink">
+                ลองอีกครั้ง
+              </button>
             </div>
           )}
 
           {phase === 'ready' && (
             <>
-              <button
-                type="button"
-                onClick={handleCapture}
-                aria-label="ถ่ายรูป"
-                className="absolute bottom-28 left-1/2 flex h-20 w-20 -translate-x-1/2 items-center justify-center rounded-full border border-white/40"
-              >
-                <span className="h-[72px] w-[72px] rounded-full border-2 border-white" />
-              </button>
+              {/* แถบบน: ตั้งเวลา / สลับกล้อง */}
+              <div className="absolute inset-x-0 top-0 z-20 flex items-center justify-between bg-gradient-to-b from-black/50 to-transparent p-4">
+                <button
+                  type="button"
+                  onClick={() => setTimer((t) => (t === 0 ? 3 : t === 3 ? 10 : 0))}
+                  className={`${iconBtn} w-auto gap-1.5 px-3.5 text-xs`}
+                  aria-label="ตั้งเวลาถ่าย"
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden>
+                    <circle cx="12" cy="13" r="8" />
+                    <path d="M12 9v4l2.5 2M9 2h6" strokeLinecap="round" />
+                  </svg>
+                  {timer === 0 ? 'ปิด' : `${timer} วิ`}
+                </button>
+                {hint ? (
+                  <span className="rounded-full bg-black/55 px-3.5 py-1.5 text-xs text-white backdrop-blur-md">{hint}</span>
+                ) : (
+                  <span className="flex items-center gap-1.5 text-[10px] tracking-[0.14em] text-white/80">
+                    <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-red-500" /> LIVE
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={() => startCamera(facing === 'user' ? 'environment' : 'user')}
+                  className={iconBtn}
+                  aria-label="สลับกล้องหน้า/หลัง"
+                >
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden>
+                    <path d="M4 8h3l2-3h6l2 3h3v11H4z" strokeLinejoin="round" />
+                    <path d="M9.5 13.5a2.5 2.5 0 0 0 4.6 1.3M14.5 12.5a2.5 2.5 0 0 0-4.6-1.3" strokeLinecap="round" />
+                  </svg>
+                </button>
+              </div>
 
-              {captureMessage && (
-                <p className="absolute bottom-[152px] left-1/2 -translate-x-1/2 whitespace-nowrap rounded-full bg-night/60 px-4 py-1.5 text-xs text-white">
-                  {captureMessage}
-                </p>
+              {countdown > 0 && (
+                <span className="pointer-events-none absolute inset-0 z-20 grid place-items-center font-wordmark text-[38vw] italic leading-none text-white/90 drop-shadow-[0_6px_30px_rgba(0,0,0,0.5)] sm:text-[220px]">
+                  {countdown}
+                </span>
               )}
 
-              {savedLooks.length > 0 && (
-                <div className="absolute inset-x-0 bottom-0 flex gap-3 overflow-x-auto bg-black/40 px-4 pb-4 pt-6 backdrop-blur-[16px]">
-                  <button
-                    type="button"
-                    onClick={() => setActiveLookId(null)}
-                    className="flex h-14 w-14 shrink-0 items-center justify-center rounded-[4px] border text-[10px] text-white"
-                    style={{
-                      borderColor: activeLookId === null ? '#ffffff' : 'rgba(255,255,255,0.3)',
-                    }}
-                  >
-                    ล่าสุด
-                  </button>
-
-                  {savedLooks.map((look) => {
-                    const thumb = representativePattern(look.outfit)
+              {/* แถบล่าง: เลือกชุด + ปุ่มถ่าย */}
+              <div className="absolute inset-x-0 bottom-0 z-20 flex flex-col gap-4 bg-gradient-to-t from-black/70 via-black/35 to-transparent pb-6 pt-10">
+                <div className="flex gap-2.5 overflow-x-auto px-4 [scrollbar-width:none]">
+                  {options.map((o) => {
+                    const sw = swatchOf(o.outfit)
+                    const on = o.id === active.id
                     return (
                       <button
-                        key={look.id}
+                        key={o.id}
                         type="button"
-                        onClick={() => setActiveLookId(look.id)}
-                        aria-label="ลุคที่บันทึกไว้"
-                        className="h-14 w-14 shrink-0 rounded-[4px]"
-                        style={{
-                          border: `1px solid ${
-                            activeLookId === look.id ? '#ffffff' : 'rgba(255,255,255,0.3)'
-                          }`,
-                          backgroundImage: thumb ? `url("${thumb.pattern.src}")` : undefined,
-                          backgroundSize: 'cover',
-                          backgroundPosition: 'center',
-                          filter: thumb
-                            ? `hue-rotate(${thumb.hue}deg) saturate(${thumb.saturation}%)`
-                            : undefined,
-                        }}
-                      />
+                        onClick={() => setActiveId(o.id)}
+                        aria-pressed={on}
+                        className={`flex shrink-0 items-center gap-2 rounded-full border py-1 pl-1 pr-3.5 text-xs backdrop-blur-md transition-colors ${
+                          on ? 'border-white bg-white text-ink' : 'border-white/25 bg-black/35 text-white'
+                        }`}
+                      >
+                        <span
+                          className="relative h-7 w-7 overflow-hidden rounded-full"
+                          style={{ background: sw.tint ?? '#ddd' }}
+                        >
+                          {sw.src && (
+                            <span
+                              className="absolute inset-0 opacity-70 mix-blend-multiply"
+                              style={{ backgroundImage: `url("${sw.src}")`, backgroundSize: '18px 18px' }}
+                            />
+                          )}
+                        </span>
+                        {o.label}
+                      </button>
                     )
                   })}
                 </div>
-              )}
+
+                <div className="grid grid-cols-3 items-center px-6">
+                  <Link to="/studio" className={`${iconBtn} justify-self-start`} aria-label="กลับไปแก้ชุดในสตูดิโอ">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden>
+                      <path d="M8 4 4 7l2 3 2-1v11h8V9l2 1 2-3-4-3c-.5 1.5-2 2.5-4 2.5S8.5 5.5 8 4z" strokeLinejoin="round" />
+                    </svg>
+                  </Link>
+                  <button
+                    type="button"
+                    onClick={handleShutter}
+                    aria-label="ถ่ายรูป"
+                    className="grid h-20 w-20 place-items-center justify-self-center rounded-full border-[3px] border-white transition-transform active:scale-90"
+                  >
+                    <span className="h-[62px] w-[62px] rounded-full bg-white" />
+                  </button>
+                  <Link to="/gallery" className={`${iconBtn} justify-self-end`} aria-label="ดูแกลเลอรี">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden>
+                      <rect x="3" y="5" width="18" height="14" rx="2" />
+                      <path d="M4 17.5 9 13l3 2.5 3.5-4L21 15" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  </Link>
+                </div>
+              </div>
             </>
+          )}
+
+          {/* ดูรูปที่เพิ่งถ่าย */}
+          {shot && (
+            <div className="absolute inset-0 z-50 flex flex-col bg-night/95 backdrop-blur-sm">
+              <div className="flex min-h-0 flex-1 items-center justify-center p-5">
+                <img
+                  src={shot}
+                  alt="รูปที่เพิ่งถ่าย"
+                  className="max-h-full max-w-full rounded-lg object-contain shadow-[0_30px_60px_-20px_rgba(0,0,0,0.8)]"
+                />
+              </div>
+              <p className="text-center text-xs text-white/60">{savedNote}</p>
+              <div className="flex gap-3 p-5">
+                <button type="button" onClick={() => setShot(null)} className="btn h-12 flex-1 border border-white/30 text-white">
+                  ถ่ายใหม่
+                </button>
+                <button type="button" onClick={sharePhoto} className="btn h-12 flex-1 bg-white text-ink">
+                  บันทึก / แชร์
+                </button>
+              </div>
+            </div>
           )}
         </div>
       )}
