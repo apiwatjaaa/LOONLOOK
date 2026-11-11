@@ -57,3 +57,36 @@ export function clothesToCanvas(values: Float32Array, width: number, height: num
   ctx.putImageData(img, 0, 0)
   return covered / values.length
 }
+
+/**
+ * หาเส้นแบ่ง "เสื้อ / กางเกง" จากภาพเสื้อผ้า
+ * ไล่ดูแต่ละแถวช่วงเอว ถ้ามีแถวที่แทบไม่มีผ้า (เช่น เสื้อครอปเห็นพุง) → แบ่งตรงนั้น
+ * คืนค่าเป็นสัดส่วนความสูงภาพ (0–1) หรือ null ถ้าไม่เจอช่องว่าง
+ */
+export function findWaistGap(
+  values: Float32Array,
+  width: number,
+  height: number,
+  x0: number,
+  x1: number,
+  yFrom: number,
+  yTo: number,
+): number | null {
+  const ax = Math.max(0, Math.floor(x0 * width))
+  const bx = Math.min(width - 1, Math.ceil(x1 * width))
+  const ay = Math.max(0, Math.floor(yFrom * height))
+  const by = Math.min(height - 1, Math.ceil(yTo * height))
+  if (bx - ax < 4 || by - ay < 4) return null
+  const cov: number[] = []
+  for (let y = ay; y <= by; y++) {
+    let n = 0
+    for (let x = ax; x <= bx; x++) if (values[y * width + x] > 0.5) n++
+    cov.push(n / (bx - ax + 1))
+  }
+  const max = Math.max(...cov)
+  let best = -1
+  for (let i = 0; i < cov.length; i++) if (best < 0 || cov[i] < cov[best]) best = i
+  // ช่องว่างจริง: แถวนั้นมีผ้าน้อยกว่า 25% ของแถวที่มีผ้ามากสุด
+  if (best < 0 || max < 0.2 || cov[best] > max * 0.25) return null
+  return (ay + best) / height
+}

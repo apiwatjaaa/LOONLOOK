@@ -13,7 +13,7 @@ import { findPattern } from '../data/patterns'
 import { composeGarmentToImage } from '../design/composeGarment'
 import { addGalleryPhoto } from '../lib/gallery'
 import { getSegmentingLandmarker, maskToCanvas } from '../lib/poseSegmenter'
-import { CLOTHES, clothesToCanvas, getClothesSegmenter } from '../lib/clothesSegmenter'
+import { CLOTHES, clothesToCanvas, findWaistGap, getClothesSegmenter } from '../lib/clothesSegmenter'
 import { buildFabric, type Fabric } from '../lib/fabric'
 import { drawAccessory, drawBottom, drawTop, measureMask, type Body, type MaskInfo, type Pt } from '../lib/warpGarment'
 import { readSavedOutfits, type SavedOutfit } from '../lib/savedOutfits'
@@ -494,14 +494,27 @@ function TryOn() {
         if (si.width !== sw) si.width = sw
         if (si.height !== sh) si.height = sh
         si.getContext('2d')?.drawImage(video, 0, 0, sw, sh)
-        let coverage = 0
-        seg.segmentForVideo(si, ts, (res) => {
-          const m = res.confidenceMasks?.[CLOTHES]
-          if (m) coverage = clothesToCanvas(m.getAsFloat32Array(), m.width, m.height, buf.cloth)
-        })
-
         // 2) ท่าทาง: ใช้หาเส้นเอว (แบ่งลายบน/ล่าง) และขนาดลายตามตัว
         const lm = pose.detectForVideo(video, ts).landmarks[0]
+        const ok = (i: number) => !!lm && (lm[i].visibility ?? 1) > 0.6 && lm[i].y > 0 && lm[i].y < 1
+        const hipsSeen = ok(23) && ok(24) && ok(11) && ok(12)
+
+        let coverage = 0
+        let gapY: number | null = null
+        seg.segmentForVideo(si, ts, (res) => {
+          const m = res.confidenceMasks?.[CLOTHES]
+          if (!m) return
+          const values = m.getAsFloat32Array()
+          coverage = clothesToCanvas(values, m.width, m.height, buf.cloth)
+          // เสื้อครอป/เสื้อสั้น: หาช่องว่างระหว่างเสื้อกับกางเกงช่วงเอว
+          if (lm && hipsSeen) {
+            const sy = (lm[11].y + lm[12].y) / 2
+            const hy = (lm[23].y + lm[24].y) / 2
+            const torso = hy - sy
+            const xs = [lm[11].x, lm[12].x, lm[23].x, lm[24].x]
+            gapY = findWaistGap(values, m.width, m.height, Math.min(...xs), Math.max(...xs), sy + torso * 0.45, hy + torso * 0.25)
+          }
+        })
 
         ctx.save()
         if (mirror) {
@@ -536,12 +549,24 @@ function TryOn() {
           const sR = p(12), sL = p(11), hR = p(24), hL = p(23)
           unit = Math.hypot(sL.x - sR.x, sL.y - sR.y) / 4
           center = { x: (sR.x + sL.x) / 2, y: (sR.y + sL.y) / 2 }
-          const torso = Math.hypot((hR.x + hL.x) / 2 - center.x, (hR.y + hL.y) / 2 - center.y)
-          // เส้นเอว = เหนือสะโพกเล็กน้อย
-          waist = [
-            { x: hR.x, y: hR.y - torso * 0.08 },
-            { x: hL.x, y: hL.y - torso * 0.08 },
-          ]
+          // แบ่งบน/ล่างเฉพาะตอนเห็นสะโพกชัด (ไม่งั้นทั้งตัวใช้ลายท่อนบน)
+          if (hipsSeen) {
+            if (gapY !== null) {
+              // เจอช่องว่างผ้า (เสื้อครอป) → แบ่งตรงนั้น เอียงตามแนวสะโพก
+              const dy = gapY * lh - (hR.y + hL.y) / 2
+              waist = [
+                { x: hR.x, y: hR.y + dy },
+                { x: hL.x, y: hL.y + dy },
+              ]
+            } else {
+              // ไม่เจอ → ใช้แนวสะโพก (ขอบกางเกงโดยประมาณ)
+              const torso = Math.hypot((hR.x + hL.x) / 2 - center.x, (hR.y + hL.y) / 2 - center.y)
+              waist = [
+                { x: hR.x, y: hR.y - torso * 0.02 },
+                { x: hL.x, y: hL.y - torso * 0.02 },
+              ]
+            }
+          }
         }
         const fill = (fab: Fabric) => {
           const pat = fctx.createPattern(fab.canvas, 'repeat')
@@ -602,7 +627,7 @@ function TryOn() {
         lctx.drawImage(buf.shade, 0, 0)
         lctx.drawImage(soft, 0, 0, lw, lh)
         lctx.globalCompositeOperation = 'multiply'
-        lctx.globalAlpha = 0.35
+        lctx.globalAlpha = 0.2
         lctx.drawImage(buf.shade, 0, 0)
         lctx.globalAlpha = 1
         lctx.globalCompositeOperation = 'destination-in'
