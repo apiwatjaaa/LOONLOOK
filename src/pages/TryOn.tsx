@@ -15,6 +15,7 @@ import { addGalleryPhoto } from '../lib/gallery'
 import { getSegmentingLandmarker, maskToCanvas } from '../lib/poseSegmenter'
 import { CLOTHES, clothesToCanvas, findWaistGap, getClothesSegmenter } from '../lib/clothesSegmenter'
 import { buildFabric, type Fabric } from '../lib/fabric'
+import { hipsVisible, makeBuffers, paintRecolor, type Landmark } from '../lib/recolor'
 import { drawAccessory, drawBottom, drawTop, measureMask, type Body, type MaskInfo, type Pt } from '../lib/warpGarment'
 import { readSavedOutfits, type SavedOutfit } from '../lib/savedOutfits'
 import type { CustomPatterns, OutfitConfigs } from '../store/useOutfit'
@@ -22,8 +23,8 @@ import { useOutfitStore } from '../store/useOutfit'
 
 type Phase = 'intro' | 'loading' | 'ready' | 'error'
 type Facing = 'user' | 'environment'
-// real = ย้อมลายบนเสื้อที่ใส่อยู่จริง (สมจริง) · overlay = สวมชุดใหม่ทับตัว (เปลี่ยนทรงได้)
-type Mode = 'real' | 'overlay'
+// photo = ถ่ายรูปก่อนแล้ว AI แต่งชุดแบบละเอียด (ลื่นสุด สวยสุด) · real = ย้อมลายบนเสื้อจริงแบบสด · overlay = สวมชุดใหม่ทับตัว
+type Mode = 'photo' | 'real' | 'overlay'
 
 type EquippedItem = {
   garment: Garment
@@ -90,6 +91,15 @@ function tuneForBody(fit: Fit, garment: Garment): Fit {
   }
 }
 
+// หาเส้นแบ่งเสื้อ/กางเกงจากภาพเสื้อผ้า โดยดูช่วงเอวของคน
+function waistGapFor(values: Float32Array, w: number, h: number, lm: Landmark[]) {
+  const sy = (lm[11].y + lm[12].y) / 2
+  const hy = (lm[23].y + lm[24].y) / 2
+  const torso = hy - sy
+  const xs = [lm[11].x, lm[12].x, lm[23].x, lm[24].x]
+  return findWaistGap(values, w, h, Math.min(...xs), Math.max(...xs), sy + torso * 0.45, hy + torso * 0.25)
+}
+
 // สีตัวแทนของชุด (ใช้ทำปุ่มในแถบเลือกชุด)
 function swatchOf(outfit: OutfitConfigs) {
   const config = outfit.top ?? outfit.full ?? outfit.bottom
@@ -107,7 +117,11 @@ function TryOn() {
   const facingRef = useRef<Facing>('user')
   const hintRef = useRef('')
   const pointsRef = useRef<Record<number, Pt>>({})
-  const modeRef = useRef<Mode>('real')
+  const modeRef = useRef<Mode>('photo')
+  // โหมดถ่ายแล้วแต่ง: รูปที่ถ่าย + ตำแหน่งเสื้อผ้า (เก็บไว้ เปลี่ยนลุคได้ทันทีไม่ต้องถ่ายใหม่)
+  const captureRef = useRef<(() => Promise<void>) | null>(null)
+  const photoRef = useRef<{ frame: HTMLCanvasElement; mask: HTMLCanvasElement; lm?: Landmark[]; gapY: number | null; found: boolean } | null>(null)
+  const photoBuf = useRef(makeBuffers())
   const fabricsRef = useRef<{ top: Fabric | null; bottom: Fabric | null }>({ top: null, bottom: null })
   const models = useRef<{ overlay: PoseLandmarker | null; pose: PoseLandmarker | null; seg: ImageSegmenter | null }>({
     overlay: null,
@@ -126,7 +140,10 @@ function TryOn() {
   const [savedNote, setSavedNote] = useState('')
   const [savedLooks, setSavedLooks] = useState<SavedOutfit[]>([])
   const [activeId, setActiveId] = useState('current')
-  const [mode, setMode] = useState<Mode>('real')
+  const [mode, setMode] = useState<Mode>('photo')
+  const [processing, setProcessing] = useState(false)
+  const [photoUrl, setPhotoUrl] = useState<string | null>(null)
+  const [photoNote, setPhotoNote] = useState('')
 
   const storeConfigs = useOutfitStore((s) => s.configs)
   const storeCustomPatterns = useOutfitStore((s) => s.customPatterns)
@@ -183,7 +200,11 @@ function TryOn() {
         buildFabric(active.outfit, active.outfit.top ? 'top' : 'full', active.custom).catch(() => null),
         buildFabric(active.outfit, 'bottom', active.custom).catch(() => null),
       ])
-      if (!cancelled) fabricsRef.current = { top, bottom }
+      if (!cancelled) {
+        fabricsRef.current = { top, bottom }
+        // ถ้ากำลังดูรูปที่ถ่ายไว้ → แต่งใหม่ด้วยลุคที่เพิ่งเลือก
+        if (photoRef.current) recomposePhoto()
+      }
     }
     build()
     return () => {
@@ -212,10 +233,53 @@ function TryOn() {
     setHint(next)
   }
 
+  // แต่งชุดบนรูปที่ถ่ายไว้ (เร็ว: ใช้ตำแหน่งเสื้อผ้าเดิม แค่ปูลายใหม่)
+  function recomposePhoto() {
+    const p = photoRef.current
+    if (!p) return
+    const { frame, mask, lm, gapY, found } = p
+    const out = document.createElement('canvas')
+    out.width = frame.width
+    out.height = frame.height
+    const o = out.getContext('2d')
+    if (!o) return
+    o.drawImage(frame, 0, 0)
+    const { top, bottom } = fabricsRef.current
+    if (found && (top || bottom)) {
+      const lit = paintRecolor({ src: frame, w: frame.width, h: frame.height, mask, top, bottom, lm, gapY, buf: photoBuf.current })
+      o.drawImage(lit, 0, 0)
+    }
+    // ลายน้ำชื่อโครงงาน
+    const size = Math.max(18, Math.round(out.width * 0.05))
+    o.font = `italic ${size}px "Bodoni Moda", serif`
+    o.fillStyle = 'rgba(255,255,255,0.85)'
+    o.textAlign = 'right'
+    o.textBaseline = 'bottom'
+    const margin = Math.round(out.width * 0.045)
+    o.fillText('Long Look', out.width - margin, out.height - margin)
+    setPhotoUrl(out.toDataURL('image/jpeg', 0.9))
+  }
+
+  function closePhoto() {
+    photoRef.current = null
+    setPhotoUrl(null)
+    setPhotoNote('')
+  }
+
+  async function savePhoto() {
+    if (!photoUrl) return
+    try {
+      addGalleryPhoto(photoUrl)
+    } catch {
+      /* แกลเลอรีเต็ม: ยังบันทึกลงเครื่องได้ */
+    }
+    await shareUrl(photoUrl)
+  }
+
   // โหลดโมเดล AI ที่โหมดนั้นใช้ (โหลดครั้งเดียว)
   async function ensureModels(m: Mode) {
     const cur = models.current
-    if (m === 'real') {
+    if (m === 'real' || m === 'photo') {
       const [pose, seg] = await Promise.all([
         cur.pose ?? getPoseLandmarker(),
         cur.seg ?? getClothesSegmenter(),
@@ -472,6 +536,114 @@ function TryOn() {
       let aiCount = 0
       let litReady = false
       let lastLm: PoseLandmarkerResult['landmarks'][number] | undefined
+      const liveBuf = makeBuffers()
+      const nextTs = () => (lastTs = Math.max(performance.now(), lastTs + 1))
+
+      // ====== โหมด "ถ่ายแล้วแต่ง" ======
+      // ถ่ายภาพนิ่ง → AI หาเสื้อผ้าแบบละเอียด 2 รอบ (ทั้งภาพ + ซูมเฉพาะตัวคน ขอบคมขึ้น)
+      captureRef.current = async () => {
+        setProcessing(true)
+        try {
+          await ensureModels('photo')
+          const m = models.current
+          if (!m.seg || !m.pose) throw new Error('AI ยังไม่พร้อม')
+          await new Promise((r) => setTimeout(r, 30)) // ให้หน้าจอขึ้น "กำลังแต่งชุด" ก่อน
+
+          // 1) ภาพนิ่ง (กลับด้านแบบกระจกถ้าเป็นกล้องหน้า ให้ตรงกับที่เห็น)
+          const W = video.videoWidth
+          const H = video.videoHeight
+          const k = Math.min(1, 1440 / Math.max(W, H))
+          const frame = document.createElement('canvas')
+          frame.width = Math.round(W * k)
+          frame.height = Math.round(H * k)
+          const fx = frame.getContext('2d')
+          if (!fx) throw new Error('canvas')
+          if (facingRef.current === 'user') {
+            fx.translate(frame.width, 0)
+            fx.scale(-1, 1)
+          }
+          fx.drawImage(video, 0, 0, frame.width, frame.height)
+          fx.setTransform(1, 0, 0, 1, 0, 0)
+
+          // 2) ท่าทาง
+          const lm = m.pose.detectForVideo(frame, nextTs()).landmarks[0] as Landmark[] | undefined
+
+          // 3) หาเสื้อผ้าทั้งภาพ
+          const small = (src: CanvasImageSource, sw: number, sh: number, max: number) => {
+            const c = document.createElement('canvas')
+            const s2 = Math.min(1, max / Math.max(sw, sh))
+            c.width = Math.max(16, Math.round(sw * s2))
+            c.height = Math.max(16, Math.round(sh * s2))
+            c.getContext('2d')?.drawImage(src, 0, 0, c.width, c.height)
+            return c
+          }
+          const mask = document.createElement('canvas')
+          mask.width = frame.width
+          mask.height = frame.height
+          const mx = mask.getContext('2d')
+          if (!mx) throw new Error('canvas')
+          mx.imageSmoothingQuality = 'high'
+          const fullMask = document.createElement('canvas')
+          let coverage = 0
+          let gapY: number | null = null
+          m.seg.segmentForVideo(small(frame, frame.width, frame.height, 512), nextTs(), (res) => {
+            const cm = res.confidenceMasks?.[CLOTHES]
+            if (!cm) return
+            const values = cm.getAsFloat32Array()
+            coverage = clothesToCanvas(values, cm.width, cm.height, fullMask)
+            if (lm && hipsVisible(lm)) gapY = waistGapFor(values, cm.width, cm.height, lm)
+          })
+          mx.drawImage(fullMask, 0, 0, mask.width, mask.height)
+
+          // 4) ซูมเฉพาะตัวคน แล้วหาเสื้อผ้าอีกรอบ (ละเอียดกว่า) แปะทับช่วงตัวคน
+          if (lm) {
+            const pts = lm.filter((p) => (p.visibility ?? 1) > 0.3)
+            if (pts.length > 4) {
+              const xs = pts.map((p) => p.x)
+              const ys = pts.map((p) => p.y)
+              let x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys)
+              const bw = x1 - x0
+              const bh = y1 - y0
+              x0 = Math.max(0, x0 - bw * 0.35)
+              x1 = Math.min(1, x1 + bw * 0.35)
+              y0 = Math.max(0, y0 - bh * 0.12)
+              y1 = Math.min(1, y1 + bh * 0.08)
+              if ((x1 - x0) * (y1 - y0) < 0.8) {
+                const rx = Math.round(x0 * frame.width)
+                const ry = Math.round(y0 * frame.height)
+                const rw = Math.max(16, Math.round((x1 - x0) * frame.width))
+                const rh = Math.max(16, Math.round((y1 - y0) * frame.height))
+                const crop = document.createElement('canvas')
+                const cs = Math.min(1, 512 / Math.max(rw, rh))
+                crop.width = Math.max(16, Math.round(rw * cs))
+                crop.height = Math.max(16, Math.round(rh * cs))
+                crop.getContext('2d')?.drawImage(frame, rx, ry, rw, rh, 0, 0, crop.width, crop.height)
+                const cropMask = document.createElement('canvas')
+                let ok = false
+                m.seg.segmentForVideo(crop, nextTs(), (res) => {
+                  const cm = res.confidenceMasks?.[CLOTHES]
+                  if (!cm) return
+                  ok = clothesToCanvas(cm.getAsFloat32Array(), cm.width, cm.height, cropMask) > 0.01
+                })
+                if (ok) {
+                  mx.clearRect(rx, ry, rw, rh)
+                  mx.drawImage(cropMask, rx, ry, rw, rh)
+                }
+              }
+            }
+          }
+
+          const found = coverage > 0.004
+          photoRef.current = { frame, mask, lm, gapY, found }
+          setPhotoNote(found ? '' : 'ไม่เจอเสื้อผ้าในรูป ลองถ่ายให้เห็นตัวชัด ๆ ในที่สว่าง')
+          recomposePhoto()
+        } catch (err) {
+          console.error(err)
+          setPhotoNote('แต่งชุดไม่สำเร็จ ลองถ่ายใหม่อีกครั้ง')
+        } finally {
+          setProcessing(false)
+        }
+      }
 
       const renderReal = (seg: ImageSegmenter, pose: PoseLandmarker, ts: number, runAI: boolean) => {
         const W = canvas.width
@@ -484,24 +656,13 @@ function TryOn() {
             ctx.translate(-W, 0)
           }
           ctx.drawImage(video, 0, 0, W, H)
-          if (litReady) ctx.drawImage(buf.lit, 0, 0, W, H)
+          if (litReady) ctx.drawImage(liveBuf.lit, 0, 0, W, H)
           ctx.restore()
           return
         }
         const scale = Math.min(1, 540 / Math.max(W, H))
         const lw = Math.round(W * scale)
         const lh = Math.round(H * scale)
-        const prep = (c: HTMLCanvasElement) => {
-          if (c.width !== lw) c.width = lw
-          if (c.height !== lh) c.height = lh
-          const x = c.getContext('2d')
-          if (!x) return null
-          x.setTransform(1, 0, 0, 1, 0, 0)
-          x.globalCompositeOperation = 'source-over'
-          x.globalAlpha = 1
-          x.clearRect(0, 0, lw, lh)
-          return x
-        }
 
         // 1) หาเสื้อผ้า (ย่อภาพก่อนให้เร็ว)
         const si = buf.segIn
@@ -511,12 +672,10 @@ function TryOn() {
         if (si.width !== sw) si.width = sw
         if (si.height !== sh) si.height = sh
         si.getContext('2d')?.drawImage(video, 0, 0, sw, sh)
-        // 2) ท่าทาง: ใช้หาเส้นเอว (แบ่งลายบน/ล่าง) และขนาดลายตามตัว
-        // ท่าทางเปลี่ยนช้ากว่าเสื้อผ้า: ตรวจทุก 2 รอบพอ
+        // 2) ท่าทาง (เปลี่ยนช้ากว่าเสื้อผ้า ตรวจทุก 2 รอบพอ)
         if (aiCount++ % 2 === 0 || !lastLm) lastLm = pose.detectForVideo(video, ts).landmarks[0]
         const lm = lastLm
-        const ok = (i: number) => !!lm && (lm[i].visibility ?? 1) > 0.6 && lm[i].y > 0 && lm[i].y < 1
-        const hipsSeen = ok(23) && ok(24) && ok(11) && ok(12)
+        const hipsSeen = hipsVisible(lm)
 
         let coverage = 0
         let gapY: number | null = null
@@ -525,14 +684,7 @@ function TryOn() {
           if (!m) return
           const values = m.getAsFloat32Array()
           coverage = clothesToCanvas(values, m.width, m.height, buf.cloth)
-          // เสื้อครอป/เสื้อสั้น: หาช่องว่างระหว่างเสื้อกับกางเกงช่วงเอว
-          if (lm && hipsSeen) {
-            const sy = (lm[11].y + lm[12].y) / 2
-            const hy = (lm[23].y + lm[24].y) / 2
-            const torso = hy - sy
-            const xs = [lm[11].x, lm[12].x, lm[23].x, lm[24].x]
-            gapY = findWaistGap(values, m.width, m.height, Math.min(...xs), Math.max(...xs), sy + torso * 0.45, hy + torso * 0.25)
-          }
+          if (lm && hipsSeen) gapY = waistGapFor(values, m.width, m.height, lm)
         })
 
         ctx.save()
@@ -550,111 +702,8 @@ function TryOn() {
           return
         }
         updateHint('')
-
-        const fctx = prep(buf.fitted)
-        const bctx = prep(buf.base)
-        const lctx = prep(buf.lit)
-        const sctx = prep(buf.shade)
-        if (!fctx || !bctx || !lctx || !sctx) {
-          ctx.restore()
-          return
-        }
-
-        // ขนาดลาย: ราว 4 ช่องลายต่อความกว้างไหล่
-        let unit = lh * 0.05
-        let center = { x: lw / 2, y: lh / 2 }
-        let waist: [Pt, Pt] | null = null
-        if (lm) {
-          const p = (i: number) => ({ x: lm[i].x * lw, y: lm[i].y * lh })
-          const sR = p(12), sL = p(11), hR = p(24), hL = p(23)
-          unit = Math.hypot(sL.x - sR.x, sL.y - sR.y) / 4
-          center = { x: (sR.x + sL.x) / 2, y: (sR.y + sL.y) / 2 }
-          // แบ่งบน/ล่างเฉพาะตอนเห็นสะโพกชัด (ไม่งั้นทั้งตัวใช้ลายท่อนบน)
-          if (hipsSeen) {
-            if (gapY !== null) {
-              // เจอช่องว่างผ้า (เสื้อครอป) → แบ่งตรงนั้น เอียงตามแนวสะโพก
-              const dy = gapY * lh - (hR.y + hL.y) / 2
-              waist = [
-                { x: hR.x, y: hR.y + dy },
-                { x: hL.x, y: hL.y + dy },
-              ]
-            } else {
-              // ไม่เจอ → ใช้แนวสะโพก (ขอบกางเกงโดยประมาณ)
-              const torso = Math.hypot((hR.x + hL.x) / 2 - center.x, (hR.y + hL.y) / 2 - center.y)
-              waist = [
-                { x: hR.x, y: hR.y - torso * 0.02 },
-                { x: hL.x, y: hL.y - torso * 0.02 },
-              ]
-            }
-          }
-        }
-        const fill = (fab: Fabric) => {
-          const pat = fctx.createPattern(fab.canvas, 'repeat')
-          if (!pat) return
-          const k = unit / 64
-          pat.setTransform(new DOMMatrix().translate(center.x, center.y).rotate(fab.rotation).scale(k))
-          fctx.fillStyle = pat
-          fctx.fillRect(0, 0, lw, lh)
-        }
-        if (top) fill(top)
-        // ท่อนล่าง: ใต้เส้นเอว
-        if (bottom && waist) {
-          const [a, b] = waist
-          const slope = (b.y - a.y) / (b.x - a.x || 1)
-          const yAt = (x: number) => a.y + (x - a.x) * slope
-          fctx.save()
-          fctx.beginPath()
-          fctx.moveTo(0, yAt(0))
-          fctx.lineTo(lw, yAt(lw))
-          fctx.lineTo(lw, lh)
-          fctx.lineTo(0, lh)
-          fctx.closePath()
-          fctx.clip()
-          fill(bottom)
-          fctx.restore()
-        } else if (bottom && !top) fill(bottom)
-
-        // 3) ตัดให้อยู่เฉพาะเสื้อผ้า (ขยายภาพเงาเสื้อแบบนุ่ม ๆ)
-        fctx.imageSmoothingEnabled = true
-        fctx.globalCompositeOperation = 'destination-in'
-        fctx.drawImage(buf.cloth, 0, 0, lw, lh)
-        fctx.globalCompositeOperation = 'source-over'
-
-        // 4) แสงเงา + รอยยับจากเสื้อจริง (ขาวดำ หักแสงรวมออก)
-        sctx.drawImage(video, 0, 0, lw, lh)
-        sctx.globalCompositeOperation = 'saturation'
-        sctx.fillStyle = '#808080'
-        sctx.fillRect(0, 0, lw, lh)
-        sctx.globalCompositeOperation = 'source-over'
-        const soft = buf.soft
-        const tw = Math.max(8, Math.round(lw / 24))
-        const th = Math.max(8, Math.round(lh / 24))
-        if (soft.width !== tw) soft.width = tw
-        if (soft.height !== th) soft.height = th
-        const tctx = soft.getContext('2d')
-        if (tctx) {
-          tctx.globalCompositeOperation = 'source-over'
-          tctx.drawImage(buf.shade, 0, 0, tw, th)
-          tctx.globalCompositeOperation = 'difference'
-          tctx.fillStyle = '#ffffff'
-          tctx.fillRect(0, 0, tw, th)
-          tctx.globalCompositeOperation = 'source-over'
-        }
-        bctx.drawImage(buf.fitted, 0, 0)
-        lctx.drawImage(buf.base, 0, 0)
-        lctx.globalCompositeOperation = 'soft-light'
-        lctx.globalAlpha = 0.9
-        lctx.drawImage(buf.shade, 0, 0)
-        lctx.drawImage(soft, 0, 0, lw, lh)
-        lctx.globalCompositeOperation = 'multiply'
-        lctx.globalAlpha = 0.2
-        lctx.drawImage(buf.shade, 0, 0)
-        lctx.globalAlpha = 1
-        lctx.globalCompositeOperation = 'destination-in'
-        lctx.drawImage(buf.base, 0, 0)
-        lctx.globalCompositeOperation = 'source-over'
-
-        ctx.drawImage(buf.lit, 0, 0, W, H)
+        paintRecolor({ src: video, w: lw, h: lh, mask: buf.cloth, top, bottom, lm, gapY, buf: liveBuf })
+        ctx.drawImage(liveBuf.lit, 0, 0, W, H)
         litReady = true
         ctx.restore()
       }
@@ -668,7 +717,17 @@ function TryOn() {
           const ts = Math.max(performance.now(), lastTs + 1)
           lastTs = ts
           const m = models.current
-          if (modeRef.current === 'real' && m.seg && m.pose) {
+          if (modeRef.current === 'photo') {
+            // ถ่ายแล้วแต่ง: ระหว่างเล็งเป็นกล้องธรรมดา ไม่มี AI → ลื่นเต็มที่
+            ctx.save()
+            if (facingRef.current === 'user') {
+              ctx.scale(-1, 1)
+              ctx.translate(-canvas.width, 0)
+            }
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+            ctx.restore()
+            updateHint('')
+          } else if (modeRef.current === 'real' && m.seg && m.pose) {
             const runAI = ts - lastAI > 62
             if (runAI) lastAI = ts
             renderReal(m.seg, m.pose, ts, runAI)
@@ -703,6 +762,10 @@ function TryOn() {
   }
 
   function takePhoto() {
+    if (modeRef.current === 'photo') {
+      captureRef.current?.()
+      return
+    }
     const canvas = canvasRef.current
     if (!canvas || phase !== 'ready') return
 
@@ -760,8 +823,11 @@ function TryOn() {
   }
 
   async function sharePhoto() {
-    if (!shot) return
-    const blob = await (await fetch(shot)).blob()
+    if (shot) await shareUrl(shot)
+  }
+
+  async function shareUrl(url: string) {
+    const blob = await (await fetch(url)).blob()
     const file = new File([blob], `longlook-${Date.now()}.jpg`, { type: 'image/jpeg' })
     // มือถือ: เปิดเมนูแชร์ (บันทึกลงอัลบั้ม / ส่ง LINE / IG) · คอม: ดาวน์โหลดไฟล์
     if (navigator.canShare?.({ files: [file] })) {
@@ -774,7 +840,7 @@ function TryOn() {
       }
     }
     const link = document.createElement('a')
-    link.href = shot
+    link.href = url
     link.download = file.name
     link.click()
   }
@@ -886,8 +952,8 @@ function TryOn() {
                 <div className="flex rounded-full border border-white/20 bg-black/40 p-1 text-xs text-white backdrop-blur-md">
                   {(
                     [
-                      ['real', 'ลายบนเสื้อจริง'],
-                      ['overlay', 'สวมชุดใหม่'],
+                      ['photo', 'ถ่ายแล้วแต่ง'],
+                      ['real', 'สด'],
                     ] as const
                   ).map(([id, label]) => (
                     <button
@@ -965,6 +1031,69 @@ function TryOn() {
                 </div>
               </div>
             </>
+          )}
+
+          {/* AI กำลังแต่งชุด */}
+          {processing && (
+            <div className="absolute inset-0 z-50 flex flex-col items-center justify-center gap-4 bg-night/80 text-white backdrop-blur-sm">
+              <span aria-hidden className="h-10 w-10 animate-spin rounded-full border-[3px] border-white/25 border-t-white" />
+              <p className="font-wordmark text-2xl italic">Styling…</p>
+              <p className="text-sm text-white/70">AI กำลังแต่งชุดให้</p>
+            </div>
+          )}
+
+          {/* ผลลัพธ์ "ถ่ายแล้วแต่ง": เปลี่ยนลุคได้ทันทีบนรูปเดิม */}
+          {photoUrl && !processing && (
+            <div className="absolute inset-0 z-50 flex flex-col bg-night">
+              <div className="relative flex min-h-0 flex-1 items-center justify-center p-4">
+                <img
+                  src={photoUrl}
+                  alt="รูปที่แต่งชุดแล้ว"
+                  className="max-h-full max-w-full rounded-xl object-contain shadow-[0_30px_60px_-20px_rgba(0,0,0,0.8)]"
+                />
+                {photoNote && (
+                  <p className="absolute inset-x-6 top-6 rounded-xl bg-black/60 px-4 py-2.5 text-center text-xs text-white backdrop-blur-md">
+                    {photoNote}
+                  </p>
+                )}
+              </div>
+              <p className="px-5 pb-2 text-[11px] tracking-[0.14em] text-white/50">ลองลุคอื่นบนรูปนี้</p>
+              <div className="flex gap-2.5 overflow-x-auto px-5 pb-4 [scrollbar-width:none]">
+                {options.map((o) => {
+                  const sw = swatchOf(o.outfit)
+                  const on = o.id === active.id
+                  return (
+                    <button
+                      key={o.id}
+                      type="button"
+                      onClick={() => setActiveId(o.id)}
+                      aria-pressed={on}
+                      className={`flex shrink-0 items-center gap-2 rounded-full border py-1 pl-1 pr-3.5 text-xs transition-colors ${
+                        on ? 'border-white bg-white text-ink' : 'border-white/25 bg-white/5 text-white'
+                      }`}
+                    >
+                      <span className="relative h-7 w-7 overflow-hidden rounded-full" style={{ background: sw.tint ?? '#ddd' }}>
+                        {sw.src && (
+                          <span
+                            className="absolute inset-0 opacity-70 mix-blend-multiply"
+                            style={{ backgroundImage: `url("${sw.src}")`, backgroundSize: '18px 18px' }}
+                          />
+                        )}
+                      </span>
+                      {o.label}
+                    </button>
+                  )
+                })}
+              </div>
+              <div className="flex gap-3 px-5 pb-6">
+                <button type="button" onClick={closePhoto} className="btn h-12 flex-1 border border-white/30 text-white">
+                  ถ่ายใหม่
+                </button>
+                <button type="button" onClick={savePhoto} className="btn h-12 flex-1 bg-white text-ink">
+                  บันทึก / แชร์
+                </button>
+              </div>
+            </div>
           )}
 
           {/* ดูรูปที่เพิ่งถ่าย */}
