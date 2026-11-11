@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import BodyOutline from '../components/BodyOutline'
 import { fitGarment } from '../ar/fitGarment'
-import { detectPose, getPoseLandmarker } from '../ar/poseDetector'
+import { getPoseLandmarker, type PoseLandmarkerResult } from '../ar/poseDetector'
 import { renderGarment } from '../ar/renderGarment'
 import { createSmoother, type Fit } from '../ar/smoothing'
 import type { Garment, GarmentSlot } from '../data/garments'
@@ -11,6 +11,7 @@ import { LOOKS } from '../data/looks'
 import { findPattern } from '../data/patterns'
 import { composeGarmentToImage } from '../design/composeGarment'
 import { addGalleryPhoto } from '../lib/gallery'
+import { getSegmentingLandmarker, maskToCanvas } from '../lib/poseSegmenter'
 import { drawAccessory, drawBottom, drawTop, measureMask, type Body, type MaskInfo, type Pt } from '../lib/warpGarment'
 import { readSavedOutfits, type SavedOutfit } from '../lib/savedOutfits'
 import type { CustomPatterns, OutfitConfigs } from '../store/useOutfit'
@@ -39,6 +40,8 @@ const ACCESSORIES: Record<string, { width: number; raise: number }> = {
   'acc-belt': { width: 1.12, raise: 0.0 }, // คาดเอว กว้างเท่าตัว
 }
 const PANTS = new Set(['bottom-wide', 'bottom-shorts'])
+// ทรงบาน: ไม่ตัดตามเงาร่าง (ผ้าต้องบานออกนอกตัวได้)
+const LOOSE = new Set(['bottom-temp', 'bottom-midi'])
 
 // ตัวเลือกชุดในแถบล่าง: ชุดจากสตูดิโอ / ลุคสำเร็จรูป / ชุดที่บันทึกไว้
 type LookOption = { id: string; label: string; outfit: OutfitConfigs; custom?: CustomPatterns }
@@ -99,7 +102,6 @@ function TryOn() {
   const facingRef = useRef<Facing>('user')
   const hintRef = useRef('')
   const pointsRef = useRef<Record<number, Pt>>({})
-  const layerRef = useRef<HTMLCanvasElement | null>(null)
 
   const [phase, setPhase] = useState<Phase>('intro')
   const [errorMsg, setErrorMsg] = useState('')
@@ -199,8 +201,10 @@ function TryOn() {
     setFacing(nextFacing)
 
     try {
+      // ใช้โมเดลแบบมีเงาร่างคนก่อน ถ้าโหลดไม่ได้ค่อยถอยไปใช้ตัวเดิม
+      const landmarkerPromise = getSegmentingLandmarker().catch(() => getPoseLandmarker())
       const [landmarker, mediaStream] = await Promise.all([
-        getPoseLandmarker(),
+        landmarkerPromise,
         navigator.mediaDevices.getUserMedia({
           video: { facingMode: nextFacing, width: { ideal: 1280 }, height: { ideal: 1280 } },
           audio: false,
@@ -223,86 +227,212 @@ function TryOn() {
       if (!ctx) return
       let lastTs = 0
 
+      // ผืนผ้าใบช่วยวาด (ใช้ซ้ำทุกเฟรม)
+      const mk = () => document.createElement('canvas')
+      const buf = { fitted: mk(), free: mk(), base: mk(), lit: mk(), shade: mk(), soft: mk(), mask: mk(), rim: mk(), tiny: mk() }
+
+      const render = (result: PoseLandmarkerResult) => {
+        const W = canvas.width
+        const H = canvas.height
+        // กล้องหน้า = กลับด้านแบบกระจก / กล้องหลัง = ภาพตรง
+        const mirror = facingRef.current === 'user'
+
+        ctx.save()
+        if (mirror) {
+          ctx.scale(-1, 1)
+          ctx.translate(-W, 0)
+        }
+        ctx.drawImage(video, 0, 0, W, H)
+
+        const landmarks = result.landmarks[0]
+        if (!landmarks) {
+          updateHint('ยืนให้กล้องเห็นตัวคุณ')
+          ctx.restore()
+          return
+        }
+
+        // เงาร่างคน (ถ้ามี) → ใช้ตัดชุดให้แนบตัวพอดี
+        const segMask = result.segmentationMasks?.[0]
+        let hasMask = false
+        if (segMask) {
+          try {
+            // เงาร่างว่างเปล่า (อ่านค่าไม่ได้) → ไม่ตัด ใช้ขนาดปกติแทน
+            hasMask = maskToCanvas(segMask.getAsFloat32Array(), segMask.width, segMask.height, buf.mask) > 0.01
+          } catch {
+            hasMask = false
+          }
+        }
+
+        // ทำให้จุดข้อต่อนิ่งขึ้น (EMA) ก่อนเอาไปยืดชุด
+        const P = (i: number): Pt => {
+          const raw = { x: landmarks[i].x * W, y: landmarks[i].y * H }
+          const prev = pointsRef.current[i]
+          const next = prev ? { x: prev.x + 0.45 * (raw.x - prev.x), y: prev.y + 0.45 * (raw.y - prev.y) } : raw
+          pointsRef.current[i] = next
+          return next
+        }
+        const seen = (i: number) => (landmarks[i]?.visibility ?? 1) >= 0.5
+        const pts: Record<number, Pt> = {}
+        for (const i of [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]) pts[i] = P(i)
+        const half = (a: Pt, b: Pt) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 })
+        const base: Body = {
+          sR: pts[12], sL: pts[11], hR: pts[24], hL: pts[23],
+          // เข่ามองไม่เห็น → ประมาณกึ่งกลางสะโพก-ข้อเท้า
+          kR: seen(26) ? pts[26] : half(pts[24], pts[28]),
+          kL: seen(25) ? pts[25] : half(pts[23], pts[27]),
+          aR: pts[28], aL: pts[27],
+          eR: seen(14) ? pts[14] : null, eL: seen(13) ? pts[13] : null,
+          wR: seen(16) ? pts[16] : null, wL: seen(15) ? pts[15] : null,
+        }
+        // ชิ้นที่ตัดตามเงาร่าง วาดให้หลวมกว่าตัวก่อน แล้วค่อยตัดขอบตามตัวจริง
+        const fittedBody: Body = { ...base, ease: hasMask ? 1.3 : 1 }
+
+        // วาดที่ความละเอียดราว 720px ให้เร็วบนมือถือ
+        const scale = Math.min(1, 720 / Math.max(W, H))
+        const lw = Math.round(W * scale)
+        const lh = Math.round(H * scale)
+        const prep = (c: HTMLCanvasElement) => {
+          if (c.width !== lw) c.width = lw
+          if (c.height !== lh) c.height = lh
+          const x = c.getContext('2d')
+          if (!x) return null
+          x.setTransform(1, 0, 0, 1, 0, 0)
+          x.globalCompositeOperation = 'source-over'
+          x.globalAlpha = 1
+          x.clearRect(0, 0, lw, lh)
+          x.setTransform(scale, 0, 0, scale, 0, 0)
+          return x
+        }
+        const fctx = prep(buf.fitted)
+        const rctx = prep(buf.free)
+        if (!fctx || !rctx) {
+          ctx.restore()
+          return
+        }
+
+        let drawn = 0
+        for (const item of equippedRef.current) {
+          const g = item.garment
+          // ใช้ fitGarment เช็กว่ากล้องเห็นจุดยึดของชิ้นนี้ครบไหม
+          const fit = fitGarment(landmarks, g.anchors, g.widthScale, g.offsetY, W, H)
+          if (!fit) continue
+          drawn++
+          const top = TOPS[g.id]
+          const acc = ACCESSORIES[g.id]
+          // กระโปรงบาน/กางเกงขากว้าง ไม่ตัดตามตัว (ทรงผ้าต้องบานออกนอกตัวได้)
+          const free = LOOSE.has(g.id)
+          const target = free ? rctx : fctx
+          const body = free ? base : fittedBody
+          if (g.slot === 'bottom') drawBottom(target, item.image, body, item.info, PANTS.has(g.id))
+          else if (top) drawTop(target, item.image, body, top.band, top.sleeve, top.hem)
+          else if (acc) drawAccessory(target, item.image, base, item.info, acc.width, acc.raise)
+          // สายคาดเฉียง/อื่น ๆ: วางแบบเดิม (หมุนตามแนวเฉียง)
+          else renderGarment(target, item.image, item.smooth(tuneForBody(uprightFit(fit), g)))
+        }
+        updateHint(drawn < equippedRef.current.length ? 'ถอยห่างอีกนิด ให้กล้องเห็นถึงเข่า' : '')
+        if (!drawn) {
+          ctx.restore()
+          return
+        }
+
+        // 1) ตัดชุดชิ้นที่แนบตัว ให้อยู่ในเงาร่างคน → พอดีตัวทุกรูปร่าง
+        if (hasMask) {
+          fctx.setTransform(1, 0, 0, 1, 0, 0)
+          fctx.globalCompositeOperation = 'destination-in'
+          fctx.drawImage(buf.mask, 0, 0, lw, lh)
+          fctx.globalCompositeOperation = 'source-over'
+        }
+
+        // 2) รวมชั้น: ชิ้นบาน (ล่าง) + ชิ้นแนบตัว (บน)
+        const bctx = prep(buf.base)
+        const lctx = prep(buf.lit)
+        const sctx = prep(buf.shade)
+        if (!bctx || !lctx || !sctx) {
+          ctx.restore()
+          return
+        }
+        bctx.setTransform(1, 0, 0, 1, 0, 0)
+        bctx.drawImage(buf.free, 0, 0)
+        bctx.drawImage(buf.fitted, 0, 0)
+
+        // 3) แสงเงาจริงจากกล้อง: เอาภาพขาวดำ (รอยยับ/เงาบนตัว) มาทาบชุดแบบ soft-light
+        //    แล้วหักแสงรวมที่เบลอ (ภาพกลับสี) ออก เหลือแต่รายละเอียดเงา ชุดสีไม่หม่นตามเสื้อเดิม
+        sctx.setTransform(1, 0, 0, 1, 0, 0)
+        sctx.drawImage(video, 0, 0, lw, lh)
+        sctx.globalCompositeOperation = 'saturation'
+        sctx.fillStyle = '#808080'
+        sctx.fillRect(0, 0, lw, lh)
+        sctx.globalCompositeOperation = 'source-over'
+        const soft = buf.soft
+        const sw = Math.max(8, Math.round(lw / 24))
+        const sh = Math.max(8, Math.round(lh / 24))
+        if (soft.width !== sw) soft.width = sw
+        if (soft.height !== sh) soft.height = sh
+        const tctx = soft.getContext('2d')
+        if (tctx) {
+          tctx.globalCompositeOperation = 'source-over'
+          tctx.drawImage(buf.shade, 0, 0, sw, sh)
+          tctx.globalCompositeOperation = 'difference'
+          tctx.fillStyle = '#ffffff'
+          tctx.fillRect(0, 0, sw, sh)
+          tctx.globalCompositeOperation = 'source-over'
+        }
+
+        lctx.setTransform(1, 0, 0, 1, 0, 0)
+        lctx.drawImage(buf.base, 0, 0)
+        lctx.globalCompositeOperation = 'soft-light'
+        lctx.globalAlpha = 0.5
+        lctx.drawImage(buf.shade, 0, 0)
+        lctx.imageSmoothingEnabled = true
+        lctx.drawImage(soft, 0, 0, lw, lh)
+        lctx.globalAlpha = 1
+
+        // 3.5) ความโค้งของตัว: ขอบลำตัว/แขน/ขาเข้มลงนุ่ม ๆ ชุดเลยดูกลมมีปริมาตร ไม่แบนเป็นแผ่น
+        if (hasMask) {
+          const rctx2 = prep(buf.rim)
+          const tiny = buf.tiny
+          const tw = Math.max(8, Math.round(lw / 36))
+          const th = Math.max(8, Math.round(lh / 36))
+          if (tiny.width !== tw) tiny.width = tw
+          if (tiny.height !== th) tiny.height = th
+          const tx = tiny.getContext('2d')
+          if (rctx2 && tx) {
+            tx.clearRect(0, 0, tw, th)
+            tx.drawImage(buf.mask, 0, 0, tw, th) // ย่อ = เบลอ
+            rctx2.setTransform(1, 0, 0, 1, 0, 0)
+            rctx2.fillStyle = '#4a4643'
+            rctx2.fillRect(0, 0, lw, lh)
+            rctx2.imageSmoothingEnabled = true
+            rctx2.drawImage(tiny, 0, 0, lw, lh) // กลางตัวขาว ขอบเทา
+            lctx.globalCompositeOperation = 'multiply'
+            lctx.drawImage(buf.rim, 0, 0)
+          }
+        }
+
+        lctx.globalCompositeOperation = 'destination-in'
+        lctx.drawImage(buf.base, 0, 0)
+        lctx.globalCompositeOperation = 'source-over'
+
+        // 4) แปะชุดลงภาพ พร้อมเงานุ่ม ๆ
+        const shoulderW = Math.hypot(pts[11].x - pts[12].x, pts[11].y - pts[12].y)
+        ctx.shadowColor = 'rgba(0,0,0,0.3)'
+        ctx.shadowBlur = shoulderW * 0.1
+        ctx.shadowOffsetY = shoulderW * 0.03
+        ctx.drawImage(buf.lit, 0, 0, W, H)
+        ctx.shadowColor = 'transparent'
+        ctx.restore()
+      }
+
       const loop = () => {
         if (cancelledRef.current) return
         if (video.videoWidth && video.videoHeight) {
           if (canvas.width !== video.videoWidth) canvas.width = video.videoWidth
           if (canvas.height !== video.videoHeight) canvas.height = video.videoHeight
-
           // timestamp ต้องเพิ่มขึ้นเสมอ ไม่งั้น MediaPipe จะ error
           const ts = Math.max(performance.now(), lastTs + 1)
           lastTs = ts
-          const result = detectPose(landmarker, video, ts)
-          // กล้องหน้า = กลับด้านแบบกระจก / กล้องหลัง = ภาพตรง
-          const mirror = facingRef.current === 'user'
-
-          ctx.save()
-          if (mirror) {
-            ctx.scale(-1, 1)
-            ctx.translate(-canvas.width, 0)
-          }
-          ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
-
-          const landmarks = result.landmarks[0]
-          if (!landmarks) {
-            updateHint('ยืนให้กล้องเห็นตัวคุณ')
-          } else {
-            // ทำให้จุดข้อต่อนิ่งขึ้น (EMA) ก่อนเอาไปยืดชุด
-            const P = (i: number): Pt => {
-              const raw = { x: landmarks[i].x * canvas.width, y: landmarks[i].y * canvas.height }
-              const prev = pointsRef.current[i]
-              const next = prev ? { x: prev.x + 0.45 * (raw.x - prev.x), y: prev.y + 0.45 * (raw.y - prev.y) } : raw
-              pointsRef.current[i] = next
-              return next
-            }
-            const seen = (i: number) => (landmarks[i]?.visibility ?? 1) >= 0.5
-            const pts: Record<number, Pt> = {}
-            for (const i of [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]) pts[i] = P(i)
-            // เข่ามองไม่เห็น → ประมาณกึ่งกลางสะโพก-ข้อเท้า
-            const half = (a: Pt, b: Pt) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 })
-            const body: Body = {
-              sR: pts[12], sL: pts[11], hR: pts[24], hL: pts[23],
-              kR: seen(26) ? pts[26] : half(pts[24], pts[28]),
-              kL: seen(25) ? pts[25] : half(pts[23], pts[27]),
-              aR: pts[28], aL: pts[27],
-              eR: seen(14) ? pts[14] : null, eL: seen(13) ? pts[13] : null,
-              wR: seen(16) ? pts[16] : null, wL: seen(15) ? pts[15] : null,
-            }
-
-            // วาดชุดทุกชิ้นลงชั้นแยก แล้วค่อยแปะลงภาพพร้อมเงา (เงาจะได้ไม่แตกเป็นช่อง ๆ)
-            const layer = layerRef.current ?? (layerRef.current = document.createElement('canvas'))
-            if (layer.width !== canvas.width) layer.width = canvas.width
-            if (layer.height !== canvas.height) layer.height = canvas.height
-            const lctx = layer.getContext('2d')
-            if (lctx) lctx.clearRect(0, 0, layer.width, layer.height)
-
-            let drawn = 0
-            const shoulderW = Math.hypot(pts[11].x - pts[12].x, pts[11].y - pts[12].y)
-            for (const item of equippedRef.current) {
-              const g = item.garment
-              // ใช้ fitGarment เช็กว่ากล้องเห็นจุดยึดของชิ้นนี้ครบไหม
-              const fit = fitGarment(landmarks, g.anchors, g.widthScale, g.offsetY, canvas.width, canvas.height)
-              if (!fit || !lctx) continue
-              drawn++
-              const top = TOPS[g.id]
-              const acc = ACCESSORIES[g.id]
-              if (g.slot === 'bottom') drawBottom(lctx, item.image, body, item.info, PANTS.has(g.id))
-              else if (top) drawTop(lctx, item.image, body, top.band, top.sleeve, top.hem)
-              else if (acc) drawAccessory(lctx, item.image, body, item.info, acc.width, acc.raise)
-              // สายคาดเฉียง/อื่น ๆ: วางแบบเดิม (หมุนตามแนวเฉียง)
-              else renderGarment(lctx, item.image, item.smooth(tuneForBody(uprightFit(fit), g)))
-            }
-            if (drawn) {
-              // เงานุ่ม ๆ ใต้ชุด ให้ดูซ้อนอยู่บนตัว ไม่แบนเหมือนกระดาษ
-              ctx.shadowColor = 'rgba(0,0,0,0.35)'
-              ctx.shadowBlur = shoulderW * 0.12
-              ctx.shadowOffsetY = shoulderW * 0.04
-              ctx.drawImage(layer, 0, 0)
-              ctx.shadowColor = 'transparent'
-            }
-            updateHint(drawn < equippedRef.current.length ? 'ถอยห่างอีกนิด ให้กล้องเห็นถึงเข่า' : '')
-          }
-          ctx.restore()
+          // วาดทั้งหมดใน callback: เงาร่างคนใช้ได้เฉพาะช่วงนี้ (MediaPipe คืนหน่วยความจำหลังจากนั้น)
+          landmarker.detectForVideo(video, ts, render)
         }
         rafRef.current = requestAnimationFrame(loop)
       }

@@ -102,6 +102,7 @@ export type Body = {
   aR: Pt; aL: Pt // ข้อเท้า 28 / 27
   eR: Pt | null; eL: Pt | null // ศอก 14 / 13 (มองไม่เห็น = null)
   wR: Pt | null; wL: Pt | null // ข้อมือ 16 / 15
+  ease?: number // >1 = วาดชุดหลวมกว่าตัว (ใช้คู่กับการตัดตามเงาร่างคน ให้ชุดแนบตัวพอดี)
 }
 
 // ขนาดตัวจริงโดยประมาณ (จุดไหล่/สะโพกเป็น "ข้อต่อ" ซึ่งแคบกว่าตัว)
@@ -110,13 +111,15 @@ function measure(b: Body) {
   const hip = len(sub(b.hL, b.hR))
   const S = mid(b.sR, b.sL)
   const H = mid(b.hR, b.hL)
+  const ease = b.ease ?? 1
   return {
+    ease,
     shoulder,
     S,
     H,
     torso: len(sub(H, S)),
-    chestW: shoulder * 1.18, // ความกว้างอก (ขอบนอกไหล่ถึงไหล่)
-    waistW: Math.max(hip * 1.7, shoulder * 0.9), // ความกว้างสะโพกจริง
+    chestW: shoulder * 1.18 * ease, // ความกว้างอก (ขอบนอกไหล่ถึงไหล่)
+    waistW: Math.max(hip * 1.7, shoulder * 0.9) * ease, // ความกว้างสะโพกจริง
   }
 }
 
@@ -190,7 +193,7 @@ export function drawTop(
         const dir = norm(sub(pts[Math.min(i + 1, pts.length - 1)], pts[Math.max(i - 1, 0)]))
         let n = { x: -dir.y, y: dir.x }
         if (n.x * outward.x + n.y * outward.y < 0) n = mul(n, -1)
-        const hw = (widths[i] * m.shoulder) / 2
+        const hw = (widths[i] * m.shoulder * m.ease) / 2
         return { v: 0.3 + (i / (pts.length - 1)) * 0.3, left: add(p, mul(n, -hw)), right: add(p, mul(n, hw)) }
       })
       // ใช้ผ้าช่วงลำตัว (ไม่โดนคอเสื้อ/สาบเสื้อ) มาทำแขนเสื้อ
