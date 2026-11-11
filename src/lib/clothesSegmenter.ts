@@ -37,12 +37,19 @@ export function getClothesSegmenter(): Promise<ImageSegmenter> {
  * ค่าความน่าจะเป็น "เสื้อผ้า" (0–1) → รูปขาว-โปร่งใส
  * gain > 1 = ขอบแน่นขึ้น, cut = ตัดค่าต่ำทิ้ง (กันลามออกนอกเสื้อ)
  */
+const cache = new WeakMap<HTMLCanvasElement, ImageData>()
+
 export function clothesToCanvas(values: Float32Array, width: number, height: number, out: HTMLCanvasElement): number {
   if (out.width !== width) out.width = width
   if (out.height !== height) out.height = height
   const ctx = out.getContext('2d')
   if (!ctx) return 0
-  const img = ctx.createImageData(width, height)
+  // ใช้ ImageData ซ้ำทุกเฟรม (ไม่สร้างใหม่ ลดภาระเครื่อง)
+  let img = cache.get(out)
+  if (!img || img.width !== width || img.height !== height) {
+    img = ctx.createImageData(width, height)
+    cache.set(out, img)
+  }
   const d = img.data
   let covered = 0
   for (let i = 0; i < values.length; i++) {

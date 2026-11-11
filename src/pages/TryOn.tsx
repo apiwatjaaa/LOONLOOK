@@ -247,7 +247,7 @@ function TryOn() {
       // โหลดโมเดลตามโหมด (อีกโหมดค่อยโหลดตอนกดสลับ)
       const mediaStream = await Promise.all([
         navigator.mediaDevices.getUserMedia({
-          video: { facingMode: nextFacing, width: { ideal: 1280 }, height: { ideal: 1280 } },
+          video: { facingMode: nextFacing, width: { ideal: 960 }, height: { ideal: 960 } },
           audio: false,
         }),
         ensureModels(modeRef.current),
@@ -467,11 +467,28 @@ function TryOn() {
 
       // ====== โหมด "ลายบนเสื้อจริง" ======
       // AI หาพิกเซลที่เป็นเสื้อผ้า → ปูผืนผ้าที่ออกแบบ → ใส่แสงเงา/รอยยับจากภาพจริง → ตัดให้อยู่ในเสื้อพอดี
-      const renderReal = (seg: ImageSegmenter, pose: PoseLandmarker, ts: number) => {
+      // ลดการกระตุก: AI ทำงานราว 15 ครั้ง/วินาที ส่วนภาพกล้องวาดทุกเฟรม (ใช้ชุดที่คำนวณล่าสุดแปะ)
+      let lastAI = 0
+      let aiCount = 0
+      let litReady = false
+      let lastLm: PoseLandmarkerResult['landmarks'][number] | undefined
+
+      const renderReal = (seg: ImageSegmenter, pose: PoseLandmarker, ts: number, runAI: boolean) => {
         const W = canvas.width
         const H = canvas.height
         const mirror = facingRef.current === 'user'
-        const scale = Math.min(1, 720 / Math.max(W, H))
+        if (!runAI) {
+          ctx.save()
+          if (mirror) {
+            ctx.scale(-1, 1)
+            ctx.translate(-W, 0)
+          }
+          ctx.drawImage(video, 0, 0, W, H)
+          if (litReady) ctx.drawImage(buf.lit, 0, 0, W, H)
+          ctx.restore()
+          return
+        }
+        const scale = Math.min(1, 540 / Math.max(W, H))
         const lw = Math.round(W * scale)
         const lh = Math.round(H * scale)
         const prep = (c: HTMLCanvasElement) => {
@@ -488,14 +505,16 @@ function TryOn() {
 
         // 1) หาเสื้อผ้า (ย่อภาพก่อนให้เร็ว)
         const si = buf.segIn
-        const sScale = 320 / Math.max(W, H)
+        const sScale = 256 / Math.max(W, H)
         const sw = Math.max(16, Math.round(W * sScale))
         const sh = Math.max(16, Math.round(H * sScale))
         if (si.width !== sw) si.width = sw
         if (si.height !== sh) si.height = sh
         si.getContext('2d')?.drawImage(video, 0, 0, sw, sh)
         // 2) ท่าทาง: ใช้หาเส้นเอว (แบ่งลายบน/ล่าง) และขนาดลายตามตัว
-        const lm = pose.detectForVideo(video, ts).landmarks[0]
+        // ท่าทางเปลี่ยนช้ากว่าเสื้อผ้า: ตรวจทุก 2 รอบพอ
+        if (aiCount++ % 2 === 0 || !lastLm) lastLm = pose.detectForVideo(video, ts).landmarks[0]
+        const lm = lastLm
         const ok = (i: number) => !!lm && (lm[i].visibility ?? 1) > 0.6 && lm[i].y > 0 && lm[i].y < 1
         const hipsSeen = ok(23) && ok(24) && ok(11) && ok(12)
 
@@ -525,6 +544,7 @@ function TryOn() {
 
         const { top, bottom } = fabricsRef.current
         if (coverage < 0.004 || (!top && !bottom)) {
+          litReady = false
           updateHint(coverage < 0.004 ? 'ยืนให้กล้องเห็นเสื้อผ้าที่ใส่อยู่' : '')
           ctx.restore()
           return
@@ -635,6 +655,7 @@ function TryOn() {
         lctx.globalCompositeOperation = 'source-over'
 
         ctx.drawImage(buf.lit, 0, 0, W, H)
+        litReady = true
         ctx.restore()
       }
 
@@ -648,7 +669,9 @@ function TryOn() {
           lastTs = ts
           const m = models.current
           if (modeRef.current === 'real' && m.seg && m.pose) {
-            renderReal(m.seg, m.pose, ts)
+            const runAI = ts - lastAI > 62
+            if (runAI) lastAI = ts
+            renderReal(m.seg, m.pose, ts, runAI)
           } else if (modeRef.current === 'overlay' && m.overlay) {
             // วาดทั้งหมดใน callback: เงาร่างคนใช้ได้เฉพาะช่วงนี้ (MediaPipe คืนหน่วยความจำหลังจากนั้น)
             m.overlay.detectForVideo(video, ts, render)
